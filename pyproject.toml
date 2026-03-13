@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rdacca_hp"
+version = "0.1.0"
+description = "Hierarchical partitioning and variation partitioning for canonical analyses in Python."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Jiangshan Lai", email = "lai@njfu.edu.cn" }
+]
+keywords = [
+  "ecology",
+  "ordination",
+  "RDA",
+  "CCA",
+  "dbRDA",
+  "variation partitioning",
+  "hierarchical partitioning"
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Information Analysis"
+]
+
+dependencies = [
+  "numpy>=1.21",
+  "pandas>=1.4",
+  "scipy>=1.8",
+  "matplotlib>=3.5"
+]
+
+[project.optional-dependencies]
+plot = [
+  "seaborn>=0.12"
+]
+dev = [
+  "pytest>=7",
+  "pytest-cov>=4",
+  "build>=1.2",
+  "twine>=5"
+]
+
+[project.urls]
+Homepage = "https://github.com/peony-peo/rdacca_hp"
+Repository = "https://github.com/peony-peo/rdacca_hp"
+Issues = "https://github.com/peony-peo/rdacca_hp/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["rdacca_hp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,0 +1,16 @@
+{
+  "case": "rda_ordered_factor_mixed",
+  "total_explained_variation": 0.365,
+  "var_part": {
+    "rownames": ["Unique to WatrCont", "Unique to Substrate", "Unique to Shrub", "Common to WatrCont and Substrate", "Common to WatrCont and Shrub", "Common to Substrate and Shrub", "Common to WatrCont, Substrate and Shrub", "Total"],
+    "values": [0.1037, 0.0476, 0.0562, 0.0069, 0.1283, 0.0007, 0.022, 0.3654],
+    "perc": [28.39, 13.03, 15.38, 1.88, 35.11, 0.19, 6.02, 100]
+  },
+  "hier_part": {
+    "rownames": ["WatrCont", "Substrate", "Shrub"],
+    "unique": [0.1037, 0.0476, 0.0562],
+    "average_share": [0.0749, 0.0111, 0.0718],
+    "individual": [0.1786, 0.0587, 0.128],
+    "perc": [48.93, 16.08, 35.07]
+  }
+}

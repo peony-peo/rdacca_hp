@@ -1,0 +1,16 @@
+{
+  "case": "rda_numeric_2vars",
+  "total_explained_variation": 0.307,
+  "var_part": {
+    "rownames": ["Unique to SubsDens", "Unique to WatrCont", "Common to SubsDens and WatrCont", "Total"],
+    "values": [0.0458, 0.2803, -0.0195, 0.3067],
+    "perc": [14.94, 91.42, -6.36, 100]
+  },
+  "hier_part": {
+    "rownames": ["SubsDens", "WatrCont"],
+    "unique": [0.0458, 0.2803],
+    "average_share": [-0.0097, -0.0097],
+    "individual": [0.0361, 0.2706],
+    "perc": [11.76, 88.14]
+  }
+}

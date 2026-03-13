@@ -1,0 +1,16 @@
+{
+  "case": "rda_unordered_factor",
+  "total_explained_variation": 0.359,
+  "var_part": {
+    "rownames": ["Unique to WatrCont", "Unique to Topo", "Unique to Substrate", "Common to WatrCont and Topo", "Common to WatrCont and Substrate", "Common to Topo and Substrate", "Common to WatrCont, Topo and Substrate", "Total"],
+    "values": [0.1349, 0.05, 0.0472, 0.0971, 0.0251, 0.0011, 0.0038, 0.3592],
+    "perc": [37.55, 13.93, 13.13, 27.03, 6.98, 0.32, 1.06, 100]
+  },
+  "hier_part": {
+    "rownames": ["WatrCont", "Topo", "Substrate"],
+    "unique": [0.1349, 0.05, 0.0472],
+    "average_share": [0.0623, 0.0504, 0.0143],
+    "individual": [0.1972, 0.1004, 0.0615],
+    "perc": [54.93, 27.97, 17.13]
+  }
+}
