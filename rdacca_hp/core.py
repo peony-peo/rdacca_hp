@@ -1,6 +1,7 @@
 # core.py
 import numpy as np
 import pandas as pd
+from functools import lru_cache
 from typing import Union, List, Dict, Any, Tuple
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
@@ -56,45 +57,137 @@ def ensure_non_negative(array, default=0.0):
     return np.maximum(array, default)
 
 
+
+
+@lru_cache(maxsize=None)
+def _get_hp_cached_structures(n_items: int):
+    """Cache combination structures reused across hierarchical partitioning calls."""
+    binary_matrix = create_binary_matrix(n_items).astype(np.int8, copy=False)
+    total_combinations = binary_matrix.shape[1]
+    bit_counts = np.sum(binary_matrix, axis=0).astype(float)
+
+    order_indices = tuple(
+        j
+        for size in range(1, n_items + 1)
+        for j in range(total_combinations)
+        if bit_counts[j] == size
+    )
+
+    combo_indices = tuple(
+        tuple(np.flatnonzero(binary_matrix[:, i]))
+        for i in range(total_combinations)
+    )
+
+    commonlist = []
+    seqID = [2 ** i for i in range(n_items)]
+    for i in range(total_combinations):
+        bit = binary_matrix[0, i]
+        if bit == 1:
+            ivname = [0, -seqID[0]]
+        else:
+            ivname = [seqID[0]]
+
+        for j in range(1, n_items):
+            bit = binary_matrix[j, i]
+            if bit == 1:
+                alist = ivname.copy()
+                blist = genList(ivname, -seqID[j])
+                ivname = alist + blist
+            else:
+                ivname = genList(ivname, seqID[j])
+
+        commonlist.append(tuple(-x for x in ivname))
+
+    return binary_matrix, total_combinations, bit_counts, order_indices, combo_indices, tuple(commonlist)
+
+
+def _fill_commonality_values(commonM: np.ndarray, commonlist) -> None:
+    """Fill commonM[:, 2] from a precomputed inclusion-exclusion structure."""
+    for i, r2list in enumerate(commonlist):
+        ccsum = 0.0
+        for indexs in r2list:
+            indexu = abs(indexs)
+            if indexu != 0:
+                ccvalue = commonM[indexu - 1, 1]
+                if indexs < 0:
+                    ccvalue = -ccvalue
+                ccsum += ccvalue
+        commonM[i, 2] = ccsum
+
+def _as_2d_float_array(x: np.ndarray) -> np.ndarray:
+    """Convert input to a 2D float ndarray without changing external behavior."""
+    arr = np.asarray(x, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    return arr
+
+
+def _r2_variance_weighted_numpy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Compute variance-weighted multioutput R² using pure NumPy.
+
+    This mirrors sklearn.metrics.r2_score(..., multioutput='variance_weighted')
+    for the non-degenerate cases relevant to the package, while avoiding the
+    heavy validation overhead that dominates permutation-time benchmarks.
+    """
+    y_true = _as_2d_float_array(y_true)
+    y_pred = _as_2d_float_array(y_pred)
+
+    diff = y_true - y_pred
+    y_mean = np.mean(y_true, axis=0, keepdims=True)
+
+    sse = np.sum(diff * diff, axis=0)
+    sst = np.sum((y_true - y_mean) ** 2, axis=0)
+
+    total_sse = float(np.sum(sse))
+    total_sst = float(np.sum(sst))
+
+    if total_sst <= 0:
+        return 1.0 if total_sse <= 0 else 0.0
+
+    r2 = 1.0 - total_sse / total_sst
+
+    if r2 > 1.0 and r2 < 1.0 + 1e-12:
+        return 1.0
+    if r2 < 0.0 and r2 > -1e-12:
+        return 0.0
+    return float(r2)
+
+
+def _fit_predict_lstsq_with_intercept(iv: np.ndarray, dv: np.ndarray) -> np.ndarray:
+    """
+    Fit the same linear model shape as sklearn LinearRegression(fit_intercept=True)
+    using NumPy least squares, and return fitted values.
+    """
+    X = _as_2d_float_array(iv)
+    Y = _as_2d_float_array(dv)
+
+    n_samples = X.shape[0]
+    intercept = np.ones((n_samples, 1), dtype=float)
+    X_design = np.concatenate((intercept, X), axis=1)
+
+    coef, _, _, _ = np.linalg.lstsq(X_design, Y, rcond=None)
+    return X_design @ coef
+
+
 def calculate_rda(dv: np.ndarray, iv: np.ndarray, type: str = "adjR2") -> float:
     """
-    Calculate R-squared for RDA analysis
+    Calculate R-squared for RDA analysis.
 
-    Parameters
-    ----------
-    dv : ndarray
-        Response variables (n_samples x n_responses)
-    iv : ndarray
-        Explanatory variables (n_samples x n_predictors)
-    type : str
-        Type of R-squared: "R2" or "adjR2"
-
-    Returns
-    -------
-    float
-        R-squared value
+    Public signature and return semantics are unchanged; the implementation is
+    optimized to avoid repeated sklearn/pandas validation overhead inside the
+    hierarchical partitioning and permutation loops.
     """
-    n_samples, n_predictors = iv.shape
-    n_responses = dv.shape[1] if len(dv.shape) > 1 else 1
+    X = _as_2d_float_array(iv)
+    Y = _as_2d_float_array(dv)
 
-    # Fit linear regression
-    model = LinearRegression()
-    model.fit(iv, dv)
-
-    # Calculate R-squared
-    y_pred = model.predict(iv)
-
-    # For RDA, use variance_weighted
-    if n_responses > 1:
-        r_squared = r2_score(dv, y_pred, multioutput='variance_weighted')
-    else:
-        r_squared = r2_score(dv.ravel(), y_pred.ravel())
+    n_samples, n_predictors = X.shape
+    y_pred = _fit_predict_lstsq_with_intercept(X, Y)
+    r_squared = _r2_variance_weighted_numpy(Y, y_pred)
 
     if type == "R2":
         return r_squared
-    else:
-        return calculate_adjusted_r2(r_squared, n_samples, n_predictors)
-
+    return calculate_adjusted_r2(r_squared, n_samples, n_predictors)
 
 def chi_square_transform(Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -463,42 +556,18 @@ def check_distance_matrix(distance_matrix: np.ndarray) -> bool:
 
 def calculate_rda_r2_adj(dv: np.ndarray, iv: np.ndarray, type: str = "adjR2") -> Tuple[float, float]:
     """
-    Calculate R-squared and adjusted R-squared for RDA (separate function for db-RDA)
+    Calculate R-squared and adjusted R-squared for RDA (separate function for db-RDA).
 
-    Parameters
-    ----------
-    dv : ndarray
-        Response variables
-    iv : ndarray
-        Explanatory variables
-    type : str
-        Type of R-squared
-
-    Returns
-    -------
-    tuple
-        (r_squared, adj_r_squared)
+    Function name, parameters, and returned tuple are unchanged.
     """
-    n_samples, n_predictors = iv.shape
-    n_responses = dv.shape[1] if len(dv.shape) > 1 else 1
+    X = _as_2d_float_array(iv)
+    Y = _as_2d_float_array(dv)
 
-    # Fit linear regression
-    model = LinearRegression()
-    model.fit(iv, dv)
-
-    # Calculate R-squared
-    y_pred = model.predict(iv)
-
-    if n_responses > 1:
-        r_squared = r2_score(dv, y_pred, multioutput='variance_weighted')
-    else:
-        r_squared = r2_score(dv.ravel(), y_pred.ravel())
-
-    # Calculate adjusted R-squared
+    n_samples, n_predictors = X.shape
+    y_pred = _fit_predict_lstsq_with_intercept(X, Y)
+    r_squared = _r2_variance_weighted_numpy(Y, y_pred)
     adj_r_squared = calculate_adjusted_r2(r_squared, n_samples, n_predictors)
-
     return r_squared, adj_r_squared
-
 
 def _calculate_dbrda_fallback(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2") -> float:
     """
@@ -684,24 +753,18 @@ def _rdacca_hp_multi(dv, iv, method, type, scale, var_part, **kwargs):
     if method.upper() == "RDA" and scale:
         dv = (dv - np.mean(dv, axis=0)) / np.std(dv, axis=0)
 
-    # Create binary matrix for all group combinations
-    binary_matrix = create_binary_matrix(n_groups)
-    total_combinations = binary_matrix.shape[1]
+    # Create binary matrix and other reusable combination structures
+    binary_matrix, total_combinations, bit_counts, order_indices, combo_indices, commonlist = _get_hp_cached_structures(n_groups)
 
     # Calculate R-squared for all group combinations
     commonM = np.zeros((total_combinations, 3))
 
-    for i in range(total_combinations):
-        # Get the combination of groups
-        mask = binary_matrix[:, i].astype(bool)
-        if np.sum(mask) == 0:
+    for i, selected_indices in enumerate(combo_indices):
+        if not selected_indices:
             continue
 
-        # Get indices of selected groups
-        selected_indices = np.where(mask)[0].tolist()
-
         # Combine selected groups
-        combined_iv = _combine_groups(iv_arrays, selected_indices)
+        combined_iv = _combine_groups(iv_arrays, list(selected_indices))
 
         # Calculate R-squared based on method
         if method.upper() in ["RDA"]:
@@ -721,53 +784,8 @@ def _rdacca_hp_multi(dv, iv, method, type, scale, var_part, **kwargs):
         else:
             raise ValueError(f"Unknown method: {method}")
 
-    # Generate commonality lists using genList
-    commonlist = []
-    seqID = [2 ** i for i in range(n_groups)]
-
-    for i in range(total_combinations):
-        bit = binary_matrix[0, i]
-        if bit == 1:
-            ivname = [0, -seqID[0]]
-        else:
-            ivname = [seqID[0]]
-
-        for j in range(1, n_groups):
-            bit = binary_matrix[j, i]
-            if bit == 1:
-                alist = ivname.copy()
-                blist = genList(ivname, -seqID[j])
-                ivname = alist + blist
-            else:
-                ivname = genList(ivname, seqID[j])
-
-        ivname = [-x for x in ivname]
-        commonlist.append(ivname)
-
-    # Calculate commonality metrics
-    for i in range(total_combinations):
-        r2list = commonlist[i]
-        numlist = len(r2list)
-        ccsum = 0
-
-        for j in range(numlist):
-            indexs = r2list[j]
-            indexu = abs(indexs)
-            if indexu != 0:
-                ccvalue = commonM[indexu - 1, 1] if indexu > 0 else 0
-                if indexs < 0:
-                    ccvalue = ccvalue * -1
-                ccsum = ccsum + ccvalue
-
-        commonM[i, 2] = ccsum
-
-    # Order the results by number of groups in combination
-    order_indices = []
-    for i in range(1, n_groups + 1):
-        for j in range(total_combinations):
-            nbits = np.sum(binary_matrix[:, j])
-            if nbits == i:
-                order_indices.append(j)
+    # Calculate commonality metrics from cached inclusion-exclusion structure
+    _fill_commonality_values(commonM, commonlist)
 
     # Fill the first column with ordered indices
     for i, idx in enumerate(order_indices):
@@ -802,7 +820,7 @@ def _rdacca_hp_multi(dv, iv, method, type, scale, var_part, **kwargs):
 
     for i in range(n_groups):
         # Calculate individual contribution (I)
-        weights = binary_matrix[i, :] * (commonM[:, 2] / (np.sum(binary_matrix, axis=0) + 1e-10))
+        weights = binary_matrix[i, :] * (commonM[:, 2] / (bit_counts + 1e-10))
         individual_value = np.sum(weights)
 
         # Ensure individual contribution is non-negative
@@ -902,20 +920,17 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
     else:
         var_names = [f"X{i + 1}" for i in range(n_vars)]
 
-    # Create binary matrix for all combinations
-    binary_matrix = create_binary_matrix(n_vars)
-    total_combinations = binary_matrix.shape[1]
+    # Create binary matrix and other reusable combination structures
+    binary_matrix, total_combinations, bit_counts, order_indices, combo_indices, commonlist = _get_hp_cached_structures(n_vars)
 
     # Calculate R-squared for all combinations
     commonM = np.zeros((total_combinations, 3))
 
-    for i in range(total_combinations):
-        # Get the combination of variables
-        mask = binary_matrix[:, i].astype(bool)
-        if np.sum(mask) == 0:
+    for i, selected_indices in enumerate(combo_indices):
+        if not selected_indices:
             continue
 
-        subset_iv = iv[:, mask]
+        subset_iv = iv[:, selected_indices]
 
         # Calculate R-squared based on method
         if method.upper() in ["RDA"]:
@@ -937,54 +952,8 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
         else:
             raise ValueError(f"Unknown method: {method}")
 
-    # Generate commonality lists using genList
-    commonlist = []
-    seqID = [2 ** i for i in range(n_vars)]
-
-    for i in range(total_combinations):
-        bit = binary_matrix[0, i]
-        if bit == 1:
-            ivname = [0, -seqID[0]]
-        else:
-            ivname = [seqID[0]]
-
-        for j in range(1, n_vars):
-            bit = binary_matrix[j, i]
-            if bit == 1:
-                alist = ivname.copy()
-                blist = genList(ivname, -seqID[j])
-                ivname = alist + blist
-            else:
-                ivname = genList(ivname, seqID[j])
-
-        ivname = [-x for x in ivname]
-        commonlist.append(ivname)
-
-    # Calculate commonality metrics
-    for i in range(total_combinations):
-        r2list = commonlist[i]
-        numlist = len(r2list)
-        ccsum = 0
-
-        for j in range(numlist):
-            indexs = r2list[j]
-            indexu = abs(indexs)
-            if indexu != 0:
-                # Note: R uses 1-indexing, Python uses 0-indexing
-                ccvalue = commonM[indexu - 1, 1] if indexu > 0 else 0
-                if indexs < 0:
-                    ccvalue = ccvalue * -1
-                ccsum = ccsum + ccvalue
-
-        commonM[i, 2] = ccsum
-
-    # Order the results by number of variables in combination
-    order_indices = []
-    for i in range(1, n_vars + 1):
-        for j in range(total_combinations):
-            nbits = np.sum(binary_matrix[:, j])
-            if nbits == i:
-                order_indices.append(j)
+    # Calculate commonality metrics from cached inclusion-exclusion structure
+    _fill_commonality_values(commonM, commonlist)
 
     # Fill the first column with ordered indices
     for i, idx in enumerate(order_indices):
@@ -1020,7 +989,7 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
 
     for i in range(n_vars):
         # Calculate individual contribution (I)
-        weights = binary_matrix[i, :] * (commonM[:, 2] / (np.sum(binary_matrix, axis=0) + 1e-10))
+        weights = binary_matrix[i, :] * (commonM[:, 2] / (bit_counts + 1e-10))
         individual_value = np.sum(weights)
 
         # 确保个体贡献非负

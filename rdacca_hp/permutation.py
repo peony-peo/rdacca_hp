@@ -3,8 +3,74 @@ import pandas as pd
 from typing import Union, List, Dict
 import time
 
-from .core import rdacca_hp
-from .utils import sanitize_tabular_input
+from .core import rdacca_hp, _rdacca_hp_multi, _rdacca_hp_single
+from .utils import sanitize_tabular_input, preprocess_predictor_dataframe
+
+
+def _build_permutation_engine(iv, method, type, scale, n_perm, add, sqrt_dist, n_axes,
+                              ordered_factors, categorical_factors, kwargs):
+    """
+    Build a lightweight evaluator for permutation runs without changing the public API
+    or output structure.
+    """
+    core_kwargs = dict(kwargs)
+    core_kwargs["n_perm"] = n_perm
+    core_kwargs["add"] = add
+    core_kwargs["sqrt_dist"] = sqrt_dist
+    core_kwargs["n_axes"] = n_axes
+    core_kwargs["ordered_factors"] = ordered_factors
+    core_kwargs["categorical_factors"] = categorical_factors
+
+    # Single DataFrame input in rdacca_hp() is internally converted into logical
+    # predictor groups (including categorical / ordered factor expansions).
+    # Do that once here, then only permute the already-prepared groups.
+    if isinstance(iv, pd.DataFrame):
+        _, encoded_groups, _ = preprocess_predictor_dataframe(
+            iv,
+            ordered_factors=ordered_factors,
+            categorical_factors=categorical_factors,
+            warn=False,
+        )
+
+        def evaluate(dv_current, iv_current):
+            return _rdacca_hp_multi(
+                dv=dv_current,
+                iv=iv_current,
+                method=method,
+                type=type,
+                scale=scale,
+                var_part=False,
+                **core_kwargs,
+            )
+
+        return encoded_groups, evaluate
+
+    if isinstance(iv, (dict, list)):
+        def evaluate(dv_current, iv_current):
+            return _rdacca_hp_multi(
+                dv=dv_current,
+                iv=iv_current,
+                method=method,
+                type=type,
+                scale=scale,
+                var_part=False,
+                **core_kwargs,
+            )
+
+        return iv, evaluate
+
+    def evaluate(dv_current, iv_current):
+        return _rdacca_hp_single(
+            dv=dv_current,
+            iv=iv_current,
+            method=method,
+            type=type,
+            scale=scale,
+            var_part=False,
+            **core_kwargs,
+        )
+
+    return iv, evaluate
 
 
 def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
@@ -41,16 +107,14 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
 
     ordered_factors = ordered_factors or {}
     categorical_factors = categorical_factors or []
-
-    if random_state is not None:
-        np.random.seed(random_state)
+    rng = np.random.default_rng(random_state)
 
     dv = sanitize_tabular_input(dv, warn=verbose)
     iv = sanitize_tabular_input(iv, warn=verbose)
 
     if verbose:
         print(f"Running permutation test with {permutations} permutations...")
-        start_time = time.time()
+        start_time = time.perf_counter()
 
     # ---- observed result ----
     obs_result = rdacca_hp(
@@ -72,36 +136,36 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
     obs_individual = obs_result.hier_part["Individual"].to_numpy(dtype=float)
     n_vars = len(obs_individual)
 
+    # ---- build a lightweight internal evaluator for permutations ----
+    perm_base_iv, perm_engine = _build_permutation_engine(
+        iv=iv,
+        method=method,
+        type=type,
+        scale=scale,
+        n_perm=n_perm,
+        add=add,
+        sqrt_dist=sqrt_dist,
+        n_axes=n_axes,
+        ordered_factors=ordered_factors,
+        categorical_factors=categorical_factors,
+        kwargs=kwargs,
+    )
+
     # ---- initialize ----
     perm_individual = np.full((permutations, n_vars), np.nan, dtype=float)
     failed_perms = 0
 
-    n_samples = _infer_n_samples(dv, iv)
+    n_samples = _infer_n_samples(dv, perm_base_iv)
 
     # ---- permutation loop ----
     for i in range(permutations):
         if verbose and (i + 1) % 100 == 0:
             print(f"  Completed {i + 1}/{permutations} permutations")
 
-        permuted_iv = _permute_variables(iv, n_samples)
+        permuted_iv = _permute_variables(perm_base_iv, n_samples, rng)
 
         try:
-            perm_result = rdacca_hp(
-                dv=dv,
-                iv=permuted_iv,
-                method=method,
-                type=type,
-                scale=scale,
-                var_part=False,
-                n_perm=n_perm,
-                add=add,
-                sqrt_dist=sqrt_dist,
-                n_axes=n_axes,
-                ordered_factors=ordered_factors,
-                categorical_factors=categorical_factors,
-                **kwargs
-            )
-
+            perm_result = perm_engine(dv, permuted_iv)
             perm_individual[i, :] = perm_result.hier_part["Individual"].to_numpy(dtype=float)
 
         except Exception as e:
@@ -132,7 +196,7 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
     result_df = _create_result_dataframe(obs_result, p_values)
 
     if verbose:
-        elapsed_time = time.time() - start_time
+        elapsed_time = time.perf_counter() - start_time
         print(f"Permutation test completed in {elapsed_time:.2f} seconds")
 
     return result_df
@@ -163,22 +227,55 @@ def _infer_n_samples(dv, iv) -> int:
     return arr.shape[0]
 
 
-def _permute_variables(iv: Union[np.ndarray, pd.DataFrame, List, Dict], n_samples: int):
+def _permute_dataframe_columns(df: pd.DataFrame, n_samples: int, rng) -> pd.DataFrame:
+    """
+    Permute each column of a DataFrame independently while preserving
+    DataFrame structure, column names, and dtypes as much as possible.
+    """
+    out = df.copy().reset_index(drop=True)
+
+    for col in out.columns:
+        perms = rng.permutation(n_samples)
+        out[col] = out[col].iloc[perms].to_numpy()
+
+    return out
+
+
+def _permute_ndarray_columns(arr: np.ndarray, n_samples: int, rng) -> np.ndarray:
+    """
+    Permute each column of an ndarray independently.
+    """
+    arr = np.asarray(arr).copy()
+
+    if arr.ndim == 1:
+        perms = rng.permutation(n_samples)
+        return arr[perms]
+
+    for j in range(arr.shape[1]):
+        perms = rng.permutation(n_samples)
+        arr[:, j] = arr[perms, j]
+
+    return arr
+
+
+def _permute_variables(
+    iv: Union[np.ndarray, pd.DataFrame, List, Dict],
+    n_samples: int,
+    rng=None,
+):
     """
     Permute predictor variables while preserving structure.
 
-    Rules
-    -----
-    1) DataFrame:
-       每一列独立置换，保留 DataFrame 结构、列名和 dtype。
-    2) dict/list:
-       每个组内部按同一个行置换同步打乱，保留组结构。
-    3) ndarray:
-       与旧逻辑一致，逐列独立置换。
+    Backward-compatible:
+    - existing calls like _permute_variables(iv, n_samples) still work
+    - optimized internal calls may pass rng explicitly
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
     # ---- grouped dict input ----
     if isinstance(iv, dict):
-        perms = np.random.permutation(n_samples)
+        perms = rng.permutation(n_samples)
         out = {}
 
         for k, v in iv.items():
@@ -194,7 +291,7 @@ def _permute_variables(iv: Union[np.ndarray, pd.DataFrame, List, Dict], n_sample
 
     # ---- grouped list input ----
     if isinstance(iv, list):
-        perms = np.random.permutation(n_samples)
+        perms = rng.permutation(n_samples)
         out = []
 
         for v in iv:
@@ -210,27 +307,10 @@ def _permute_variables(iv: Union[np.ndarray, pd.DataFrame, List, Dict], n_sample
 
     # ---- single DataFrame input ----
     if isinstance(iv, pd.DataFrame):
-        out = iv.copy().reset_index(drop=True)
-
-        for col in out.columns:
-            perms = np.random.permutation(n_samples)
-            # 保留 Series 结构，避免 object/category 被转坏
-            out[col] = out[col].iloc[perms].to_numpy()
-
-        return out
+        return _permute_dataframe_columns(iv, n_samples, rng)
 
     # ---- ndarray input ----
-    arr = np.asarray(iv).copy()
-
-    if arr.ndim == 1:
-        perms = np.random.permutation(n_samples)
-        return arr[perms]
-
-    for j in range(arr.shape[1]):
-        perms = np.random.permutation(n_samples)
-        arr[:, j] = arr[perms, j]
-
-    return arr
+    return _permute_ndarray_columns(np.asarray(iv), n_samples, rng)
 
 
 def _calculate_p_values(obs_values: np.ndarray,
