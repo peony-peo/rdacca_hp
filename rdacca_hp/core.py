@@ -17,6 +17,7 @@ from .utils import (
     generate_combination_names,
     get_combination_names,
     preprocess_predictor_dataframe,
+    coerce_distance_input,
 )
 
 
@@ -634,14 +635,9 @@ def calculate_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2",
     float
         R-squared value
     """
-    # Check if dv_dist is a valid distance matrix
-    if not check_distance_matrix(dv_dist):
-        raise ValueError("dv should be a square symmetric distance matrix for db-RDA")
-
-    n_samples = dv_dist.shape[0]
-
-    # Preprocess distance matrix
-    distance_matrix = dv_dist.copy()
+    # Accept either a square distance matrix or a condensed distance vector
+    distance_matrix = coerce_distance_input(dv_dist)
+    n_samples = distance_matrix.shape[0]
 
     # Take square root if requested
     if sqrt_dist:
@@ -1100,9 +1096,8 @@ def rdacca_hp(dv: Union[np.ndarray, pd.DataFrame],
 
     # Special check for db-RDA
     if method == "DBRDA":
-        if not check_distance_matrix(dv):
-            raise ValueError("For db-RDA, dv should be a square symmetric distance matrix")
-
+        dv = coerce_distance_input(dv)
+        
     # Handle different types of iv input
     if isinstance(iv, (list, dict)):
         # Multiple predictor groups

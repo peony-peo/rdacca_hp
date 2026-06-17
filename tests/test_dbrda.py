@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from scipy.spatial.distance import squareform
+
 from rdacca_hp.core import calculate_dbrda, rdacca_hp
 from rdacca_hp.utils import create_distance_test_data, create_test_data
 
@@ -67,3 +69,34 @@ def test_rdacca_hp_dbrda_rejects_invalid_distance_matrix():
 
     with pytest.raises(ValueError, match="square symmetric distance matrix"):
         rdacca_hp(dv=bad, iv=iv, method="dbRDA", type="R2")
+
+def test_calculate_dbrda_accepts_condensed_distance_vector():
+    dv_dist = create_distance_test_data(n_samples=20, n_species=8, seed=202)
+    dv_condensed = squareform(dv_dist)
+    _, iv = create_test_data(n_samples=20, n_predictors=3, n_responses=1, seed=202)
+
+    r2 = calculate_dbrda(dv_condensed, iv, type="R2")
+    adj_r2 = calculate_dbrda(dv_condensed, iv, type="adjR2")
+
+    assert np.isfinite(r2)
+    assert np.isfinite(adj_r2)
+
+
+def test_rdacca_hp_dbrda_accepts_condensed_distance_vector():
+    dv_dist = create_distance_test_data(n_samples=20, n_species=8, seed=303)
+    dv_condensed = squareform(dv_dist)
+    _, iv = create_test_data(n_samples=20, n_predictors=3, n_responses=1, seed=303)
+
+    result = rdacca_hp(
+        dv=dv_condensed,
+        iv=iv,
+        method="dbRDA",
+        type="adjR2",
+        var_part=True,
+        add=True,
+        sqrt_dist=False,
+    )
+
+    assert result.method_type == ["DBRDA", "adjR2"]
+    assert result.var_part is not None
+    assert np.isfinite(result.total_explained_variation)

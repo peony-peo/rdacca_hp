@@ -4,36 +4,41 @@ Python implementation of hierarchical partitioning and variation partitioning fo
 
 `rdacca_hp` provides hierarchical partitioning and variation partitioning for:
 
-- **RDA** (Redundancy Analysis)
-- **CCA** (Canonical Correspondence Analysis)
-- **dbRDA** (distance-based Redundancy Analysis)
+* **RDA** (Redundancy Analysis)
+* **CCA** (Canonical Correspondence Analysis)
+* **dbRDA** (distance-based Redundancy Analysis)
 
 It is designed for users who want a Python workflow similar to **rdacca.hp**, while supporting mixed predictor types such as:
 
-- numeric variables
-- unordered categorical variables
-- ordered categorical variables
-- grouped predictor sets
+* numeric variables
+* unordered categorical variables
+* ordered categorical variables
+* grouped predictor sets
 
 The package also provides:
 
-- permutation-based significance testing
-- plotting utilities for hierarchical partitioning and variation partitioning results
+* permutation-based significance testing
+* plotting utilities for hierarchical partitioning and variation partitioning results
 
 ---
 
 ## Features
 
-- Hierarchical partitioning (`hier_part`)
-- Variation partitioning (`var_part`)
-- Support for:
-  - numeric predictors
-  - unordered factors
-  - ordered factors
-  - grouped predictors
-- Permutation testing with `permu_hp()`
-- Plotting utilities for single results and result comparison
-- Baseline validation against R outputs for key RDA use cases
+* Hierarchical partitioning (`hier_part`)
+* Variation partitioning (`var_part`)
+* Support for:
+
+  * numeric predictors
+  * unordered factors
+  * ordered factors
+  * grouped predictors
+* Permutation testing with `permu_hp()`
+* Plotting utilities for single results and result comparison
+* Baseline validation against R outputs for key RDA use cases
+* dbRDA support for both:
+
+  * square symmetric distance matrices
+  * condensed / dist-style distance input
 
 ---
 
@@ -43,16 +48,17 @@ This package is currently in an early public release stage.
 
 At the current stage:
 
-- the **RDA** workflow has been checked carefully against the R package **rdacca.hp**
-- mixed predictor inputs (numeric + unordered factor + ordered factor) are supported
-- permutation testing is available
-- baseline tests against R outputs are included for selected cases
+* the **RDA** workflow has been checked carefully against the R package **rdacca.hp**
+* mixed predictor inputs (numeric + unordered factor + ordered factor) are supported
+* permutation testing is available
+* dbRDA supports both full distance matrices and condensed distance input
+* baseline tests against R outputs are included for selected cases
 
 Notes:
 
-- results for **RDA** are expected to closely match the R implementation in validated scenarios
-- **CCA** and **dbRDA** are implemented and tested, and further benchmark expansion is planned in future releases.
-- permutation p-values may show small Monte Carlo differences relative to R because random permutation sequences differ across platforms
+* results for **RDA** are expected to closely match the R implementation in validated scenarios
+* **CCA** and **dbRDA** are implemented and tested, and further benchmark expansion is planned in future releases
+* permutation p-values may show small Monte Carlo differences relative to R because random permutation sequences differ across platforms
 
 ---
 
@@ -62,7 +68,7 @@ Notes:
 
 ```bash
 pip install .
-````
+```
 
 ### Install in editable mode for development
 
@@ -211,7 +217,49 @@ perm_result = permu_hp(
 print(perm_result)
 ```
 
-### 5. Plotting
+### 5. dbRDA with a square distance matrix
+
+```python
+from rdacca_hp import create_distance_test_data, create_test_data, rdacca_hp
+
+dv_dist = create_distance_test_data(n_samples=30, n_species=10, seed=123)
+_, iv = create_test_data(n_samples=30, n_predictors=3, n_responses=1, seed=123)
+
+result = rdacca_hp(
+    dv=dv_dist,
+    iv=iv,
+    method="dbRDA",
+    type="adjR2",
+    var_part=True,
+    add=True,
+    n_axes=5,
+)
+
+print(result.hier_part)
+```
+
+### 6. dbRDA with condensed / dist-style input
+
+```python
+from scipy.spatial.distance import squareform
+from rdacca_hp import create_distance_test_data, create_test_data, rdacca_hp
+
+dv_dist = create_distance_test_data(n_samples=30, n_species=10, seed=123)
+dv_condensed = squareform(dv_dist)
+_, iv = create_test_data(n_samples=30, n_predictors=3, n_responses=1, seed=123)
+
+result = rdacca_hp(
+    dv=dv_condensed,
+    iv=iv,
+    method="dbRDA",
+    type="adjR2",
+    var_part=True,
+)
+
+print(result.hier_part)
+```
+
+### 7. Plotting
 
 ```python
 from rdacca_hp import create_test_data, rdacca_hp, plot_rdaccahp
@@ -261,7 +309,10 @@ Compare multiple hierarchical partitioning results in one figure.
 
 For **RDA**, users often apply Hellinger transformation before analysis when working with community data.
 
-For **dbRDA**, `dv` should be a square symmetric distance matrix.
+For **dbRDA**, `dv` can be either:
+
+* a square symmetric distance matrix
+* a valid condensed / dist-style distance vector
 
 ### Predictor matrix (`iv`)
 
@@ -407,6 +458,12 @@ Run only R baseline tests:
 pytest tests/test_r_baselines.py -q
 ```
 
+Run dbRDA-specific tests:
+
+```bash
+pytest tests/test_dbrda.py -q
+```
+
 ---
 
 ## R baseline validation
@@ -455,6 +512,15 @@ For example:
 import pandas as pd
 pd.read_csv("file.csv", keep_default_na=False)
 ```
+
+### 4. dbRDA distance input
+
+For dbRDA, the response can now be supplied either as:
+
+* a full square symmetric distance matrix, or
+* a condensed / dist-style distance vector
+
+This is intended to make the Python workflow closer to the flexibility of R-style distance input.
 
 ---
 
@@ -532,7 +598,4 @@ This project is licensed under the **MIT License**.
 Author: **Jiangshan Lai**
 Email: **[lai@njfu.edu.cn](mailto:lai@njfu.edu.cn)**
 
-Repository: https://github.com/peony-peo/rdacca_hp
-
-```
-```
+Repository: `https://github.com/peony-peo/rdacca_hp`

@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Union, Tuple
 from sklearn.metrics import pairwise_distances
+from scipy.spatial.distance import squareform
 
 def _is_strict_sequential_index(series: pd.Series) -> bool:
     """
@@ -773,6 +774,58 @@ def euclidify_distance_matrix(distance_matrix: np.ndarray, method: str = "lingoe
 
     else:
         raise ValueError("Method must be 'lingoes' or 'cailliez'")
+
+
+def is_condensed_distance_vector(x: np.ndarray) -> bool:
+    """
+    Check whether x looks like a condensed distance vector, i.e. the output of
+    scipy.spatial.distance.pdist or an R-like dist object converted to 1D.
+
+    Valid condensed length m must satisfy:
+        n * (n - 1) / 2 = m
+    for some integer n >= 2.
+    """
+    arr = np.asarray(x, dtype=float)
+
+    if arr.ndim != 1:
+        return False
+
+    m = arr.size
+    if m == 0:
+        return False
+
+    # Solve n(n-1)/2 = m
+    n = (1 + np.sqrt(1 + 8 * m)) / 2
+    n_int = int(round(n))
+
+    if n_int < 2:
+        return False
+
+    return n_int * (n_int - 1) // 2 == m
+
+
+def coerce_distance_input(distance_input: np.ndarray) -> np.ndarray:
+    """
+    Accept either:
+    1. a square symmetric distance matrix, or
+    2. a condensed distance vector (dist-like / pdist-like),
+    and return a square symmetric distance matrix.
+    """
+    arr = np.asarray(distance_input, dtype=float)
+
+    # Case 1: already a square distance matrix
+    if arr.ndim == 2:
+        if check_distance_matrix(arr):
+            return arr
+        raise ValueError("For db-RDA, dv should be a square symmetric distance matrix or a valid condensed distance vector.")
+
+    # Case 2: condensed distance vector
+    if is_condensed_distance_vector(arr):
+        mat = squareform(arr)
+        if check_distance_matrix(mat):
+            return mat
+
+    raise ValueError("For db-RDA, dv should be a square symmetric distance matrix or a valid condensed distance vector.")
 
 
 def check_distance_matrix(distance_matrix: np.ndarray) -> bool:
