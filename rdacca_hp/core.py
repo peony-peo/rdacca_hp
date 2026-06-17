@@ -609,53 +609,119 @@ def _calculate_dbrda_fallback(dv_dist: np.ndarray, iv: np.ndarray, type: str = "
         # Last resort: return a reasonable default
         return 0.0
 
+def _calculate_dbrda_vegan_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2",
+                                 add: bool = False, sqrt_dist: bool = False) -> float:
+    """
+    Vegan::dbrda-style db-RDA R2/adjusted R2.
+
+    This uses the centered Gower matrix directly:
+        B = -0.5 * J D^2 J
+
+    R2 is computed as:
+        trace(H B) / trace(B)
+
+    where H is the projection matrix of centered predictors.
+    """
+    distance_matrix = coerce_distance_input(dv_dist)
+
+    if sqrt_dist:
+        distance_matrix = np.sqrt(distance_matrix)
+
+    if add:
+        distance_matrix = euclidify_distance_matrix(distance_matrix, method="lingoes")
+
+    n_samples = distance_matrix.shape[0]
+
+    X = _as_2d_float_array(iv)
+    if X.shape[0] != n_samples:
+        raise ValueError("Dependent and independent variables must have the same number of rows.")
+
+    # Gower-centered matrix
+    J = np.eye(n_samples) - np.ones((n_samples, n_samples)) / n_samples
+    B = -0.5 * J @ (distance_matrix ** 2) @ J
+
+    total_inertia = float(np.trace(B))
+    if abs(total_inertia) < 1e-12:
+        r_squared = 0.0
+        n_predictors = X.shape[1]
+    else:
+        # Center predictors; intercept is handled by centering.
+        Xc = X - np.mean(X, axis=0, keepdims=True)
+
+        # Use rank for adjusted R2, closer to vegan behavior under collinearity.
+        n_predictors = int(np.linalg.matrix_rank(Xc))
+
+        if n_predictors == 0:
+            r_squared = 0.0
+        else:
+            # Projection matrix H = X (X'X)^- X'
+            H = Xc @ np.linalg.pinv(Xc.T @ Xc) @ Xc.T
+
+            constrained_inertia = float(np.trace(H @ B))
+            r_squared = constrained_inertia / total_inertia
+
+    if type == "R2":
+        return r_squared
+
+    return calculate_adjusted_r2(r_squared, n_samples, n_predictors)
+
 
 def calculate_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2",
-                    add: bool = False, sqrt_dist: bool = False, n_axes: int = None) -> float:
+                    add: bool = False, sqrt_dist: bool = False, n_axes: int = None,
+                    dbrdatype: str = "dbrda") -> float:
     """
-    Calculate R-squared for db-RDA (Distance-based Redundancy Analysis)
+    Calculate R-squared for db-RDA.
 
     Parameters
     ----------
     dv_dist : ndarray
-        Distance matrix (n_samples x n_samples)
+        Distance matrix or condensed distance vector.
     iv : ndarray
-        Environmental variables (n_samples x predictors)
+        Environmental variables.
     type : str
-        Type of R-squared: "R2" or "adjR2"
+        "R2" or "adjR2".
     add : bool
-        Whether to add constant to make distance matrix Euclidean
+        Whether to add a constant to euclidify dissimilarities.
     sqrt_dist : bool
-        Whether to take square root of distances
+        Whether to take square root of distances.
     n_axes : int, optional
-        Number of PCoA axes to use
+        Number of PCoA axes to use. Only used when dbrdatype="capscale".
+    dbrdatype : str
+        "dbrda" or "capscale".
 
-    Returns
-    -------
-    float
-        R-squared value
+        "dbrda" matches the default behavior of R rdacca.hp >= 1.1.3.
+        "capscale" keeps the previous Python behavior.
     """
-    # Accept either a square distance matrix or a condensed distance vector
-    distance_matrix = coerce_distance_input(dv_dist)
-    n_samples = distance_matrix.shape[0]
+    dbrdatype = str(dbrdatype).lower()
 
-    # Take square root if requested
+    if dbrdatype not in ["dbrda", "capscale"]:
+        raise ValueError("dbrdatype must be 'dbrda' or 'capscale'")
+
+    # R rdacca.hp 1.1.3 default: dbrdatype = "dbrda"
+    if dbrdatype == "dbrda":
+        return _calculate_dbrda_vegan_dbrda(
+            dv_dist=dv_dist,
+            iv=iv,
+            type=type,
+            add=add,
+            sqrt_dist=sqrt_dist,
+        )
+
+    # Previous Python behavior: capscale-like PCoA positive-axis route
+    distance_matrix = coerce_distance_input(dv_dist)
+
     if sqrt_dist:
         distance_matrix = np.sqrt(distance_matrix)
 
-    # Make Euclidean if requested
     if add:
         distance_matrix = euclidify_distance_matrix(distance_matrix, method="lingoes")
 
-    # Perform PCoA on the distance matrix
     try:
         pcoa_scores, eigenvalues = calculate_pcoa(distance_matrix, n_axes)
 
-        # Use PCoA scores as response variables in RDA
         if pcoa_scores.shape[1] == 0:
             raise ValueError("PCoA produced no positive eigenvalues")
 
-        # Calculate R-squared using RDA on PCoA scores
         r_squared, adj_r_squared = calculate_rda_r2_adj(pcoa_scores, iv, type)
 
         if type == "R2":
@@ -665,9 +731,7 @@ def calculate_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2",
 
     except Exception as e:
         print(f"db-RDA calculation failed: {e}")
-        # Fallback to simple approach
-        return _calculate_dbrda_fallback(dv_dist, iv, type)
-
+        return _calculate_dbrda_fallback(distance_matrix, iv, type)
 
 def _prepare_multi_group_iv(iv: Union[List, Dict]) -> Tuple[List[np.ndarray], List[str]]:
     """
@@ -774,7 +838,8 @@ def _rdacca_hp_multi(dv, iv, method, type, scale, var_part, **kwargs):
                 dv, combined_iv, type,
                 add=kwargs.get('add', False),
                 sqrt_dist=kwargs.get('sqrt_dist', False),
-                n_axes=kwargs.get('n_axes', None)
+                n_axes=kwargs.get('n_axes', None),
+                dbrdatype=kwargs.get('dbrdatype', 'dbrda')
             )
             commonM[i, 1] = r2_value
         else:
@@ -875,28 +940,53 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
     # Data preprocessing
     dv, iv = check_data_quality(dv, iv)
 
-    # If predictors are a mixed-type DataFrame, preprocess into encoded groups
-    # and reuse the multi-group implementation so that categorical / ordered
-    # factors remain one logical predictor group.
-    ordered_factors = kwargs.get("ordered_factors", None)
-    categorical_factors = kwargs.get("categorical_factors", None)
+    ordered_factors = kwargs.get("ordered_factors", None) or {}
+    categorical_factors = kwargs.get("categorical_factors", None) or []
 
+    # ---------------------------------------------------------
+    # IMPORTANT:
+    # Keep purely numeric DataFrame inputs on the single-table path,
+    # to match the R rdacca.hp data.frame branch.
+    #
+    # Only route to the multi-group branch when factor encoding is
+    # actually needed:
+    #   1) user explicitly declares ordered/categorical factors, or
+    #   2) the DataFrame contains non-numeric columns.
+    # ---------------------------------------------------------
     if isinstance(iv, pd.DataFrame):
-        _, encoded_groups, _ = preprocess_predictor_dataframe(
-            iv,
-            ordered_factors=ordered_factors,
-            categorical_factors=categorical_factors,
-            warn=False,
-        )
-        return _rdacca_hp_multi(
-            dv=dv,
-            iv=encoded_groups,
-            method=method,
-            type=type,
-            scale=scale,
-            var_part=var_part,
-            **kwargs,
-        )
+        has_declared_factors = bool(ordered_factors) or bool(categorical_factors)
+        has_non_numeric = not all(pd.api.types.is_numeric_dtype(iv[col]) for col in iv.columns)
+
+        if has_declared_factors or has_non_numeric:
+            _, encoded_groups, _ = preprocess_predictor_dataframe(
+                iv,
+                ordered_factors=ordered_factors,
+                categorical_factors=categorical_factors,
+                warn=False,
+            )
+            return _rdacca_hp_multi(
+                dv=dv,
+                iv=encoded_groups,
+                method=method,
+                type=type,
+                scale=scale,
+                var_part=var_part,
+                **kwargs,
+            )
+
+        # Pure numeric DataFrame: stay on single-table branch
+        var_names = iv.columns.tolist()
+        iv = iv.to_numpy(dtype=float)
+
+    else:
+        # Non-DataFrame input
+        if hasattr(iv, "columns"):
+            var_names = iv.columns.tolist()
+        else:
+            iv = np.asarray(iv, dtype=float)
+            if iv.ndim == 1:
+                iv = iv.reshape(-1, 1)
+            var_names = [f"X{i + 1}" for i in range(iv.shape[1])]
 
     n_samples, n_vars = iv.shape
 
@@ -909,12 +999,6 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
     # Standardize if requested (for RDA)
     if method.upper() == "RDA" and scale:
         dv = (dv - np.mean(dv, axis=0)) / np.std(dv, axis=0)
-
-    # Create variable names if not provided
-    if hasattr(iv, 'columns'):
-        var_names = iv.columns.tolist()
-    else:
-        var_names = [f"X{i + 1}" for i in range(n_vars)]
 
     # Create binary matrix and other reusable combination structures
     binary_matrix, total_combinations, bit_counts, order_indices, combo_indices, commonlist = _get_hp_cached_structures(n_vars)
@@ -933,16 +1017,15 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
             r2_value = calculate_rda(dv, subset_iv, type)
             commonM[i, 1] = r2_value
         elif method.upper() in ["CCA"]:
-            # Use CCA calculation
             r2_value = calculate_cca(dv, subset_iv, type, n_perm=kwargs.get('n_perm', 1000))
             commonM[i, 1] = r2_value
         elif method.upper() in ["DBRDA"]:
-            # Use db-RDA calculation
             r2_value = calculate_dbrda(
                 dv, subset_iv, type,
                 add=kwargs.get('add', False),
                 sqrt_dist=kwargs.get('sqrt_dist', False),
-                n_axes=kwargs.get('n_axes', None)
+                n_axes=kwargs.get('n_axes', None),
+                dbrdatype=kwargs.get('dbrdatype', 'dbrda')
             )
             commonM[i, 1] = r2_value
         else:
@@ -963,11 +1046,10 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
         idx = int(commonM[i, 0])
         outputcommonM[i, 0] = round(commonM[idx, 2], 4)
 
-        # 修复除零错误
         percentage = safe_divide(commonM[idx, 2], totalRSquare) * 100
-        outputcommonM[i, 1] = round(percentage, 2)  # 限制在0-100之间
+        outputcommonM[i, 1] = round(percentage, 2)
 
-    # 修复Total行
+    # Total row
     outputcommonM[total_combinations, 0] = round(totalRSquare, 4)
     outputcommonM[total_combinations, 1] = 100.0
 
@@ -975,50 +1057,40 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
     ordered_binary_matrix = binary_matrix[:, order_indices]
     rowNames = get_combination_names(ordered_binary_matrix, var_names)
 
-    # Ensure row names match the data shape
     if len(rowNames) != outputcommonM.shape[0]:
-        # Create simple sequential names if there's a mismatch
         rowNames = [f"Combination_{i + 1}" for i in range(outputcommonM.shape[0] - 1)] + ["Total"]
 
     # Calculate variable importance (hierarchical partitioning)
     VariableImportance = np.zeros((n_vars, 4))
 
     for i in range(n_vars):
-        # Calculate individual contribution (I)
         weights = binary_matrix[i, :] * (commonM[:, 2] / (bit_counts + 1e-10))
         individual_value = np.sum(weights)
-
-        # 确保个体贡献非负
         VariableImportance[i, 2] = round(individual_value, 4)
 
     # Unique contributions are the single-variable combinations
-    VariableImportance[:, 0] = outputcommonM[:n_vars, 0]  # Unique
+    VariableImportance[:, 0] = outputcommonM[:n_vars, 0]
 
     # Average shared contribution = Individual - Unique
     VariableImportance[:, 1] = VariableImportance[:, 2] - VariableImportance[:, 0]
 
-    # 修复百分比计算
+    # Percentages
     total_individual = round(np.sum(VariableImportance[:, 2]), 3)
 
     if total_individual <= 0:
-        # 如果总个体贡献为0或负，将所有百分比设为0
         VariableImportance[:, 3] = 0.0
     else:
-        # 确保个体贡献非负，然后计算百分比
         percentages = 100 * VariableImportance[:, 2] / total_individual
         VariableImportance[:, 3] = np.round(percentages, 2)
 
-    # 确保没有NaN或无限值
     VariableImportance = np.where(np.isfinite(VariableImportance), VariableImportance, np.nan)
 
-    # Create pandas DataFrames for results
     hier_part_df = pd.DataFrame(
         VariableImportance,
         columns=["Unique", "Average.share", "Individual", "I.perc(%)"],
         index=var_names
     )
 
-    # Create results object
     if var_part:
         var_part_df = pd.DataFrame(
             outputcommonM,
@@ -1049,6 +1121,7 @@ def rdacca_hp(dv: Union[np.ndarray, pd.DataFrame],
               add: bool = False,  # For db-RDA
               sqrt_dist: bool = False,  # For db-RDA
               n_axes: int = None,  # For db-RDA
+              dbrdatype: str = "dbrda",  # For db-RDA: "dbrda" or "capscale"
               ordered_factors: dict | None = None,
               categorical_factors: list | None = None,
               **kwargs) -> RdaccaHpResult:
@@ -1111,6 +1184,7 @@ def rdacca_hp(dv: Union[np.ndarray, pd.DataFrame],
         kwargs['add'] = add
         kwargs['sqrt_dist'] = sqrt_dist
         kwargs['n_axes'] = n_axes
+        kwargs['dbrdatype'] = dbrdatype
         kwargs['ordered_factors'] = ordered_factors
         kwargs['categorical_factors'] = categorical_factors
 

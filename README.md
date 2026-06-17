@@ -522,6 +522,8 @@ For dbRDA, the response can now be supplied either as:
 
 This is intended to make the Python workflow closer to the flexibility of R-style distance input.
 
+For dbRDA, rdacca_hp uses dbrdatype="dbrda" by default, matching rdacca.hp >= 1.1.3 in R. 
+Users can set dbrdatype="capscale" to use the capscale-style calculation.
 ---
 
 ## Limitations
