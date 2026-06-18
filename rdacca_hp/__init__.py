@@ -30,7 +30,7 @@ except ImportError as e:
         """Comparison plotting function - not available"""
         raise NotImplementedError("Comparison plotting functionality not available")
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 __author__ = "Jiangshan Lai"
 __email__ = "lai@njfu.edu.cn"
 

@@ -1,125 +1,80 @@
+import time
+import numpy as np
 import pandas as pd
-from sklearn.metrics import pairwise_distances
+from scipy.spatial.distance import pdist
 
-import rdacca_hp
-from rdacca_hp import rdacca_hp as run_rdacca_hp
-from rdacca_hp.core import calculate_dbrda
+from rdacca_hp import rdacca_hp, permu_hp
 
 
-def main():
-    print("=== rdacca_hp package path ===")
-    print(rdacca_hp.__file__)
+# ------------------------------------------------------------
+# Python equivalent of:
+#   spe <- doubs$fish
+#   env <- doubs$env
+#   spe <- spe[-8, ]
+#   env <- env[-8, ]
+#   env <- env[, -1]
+#   spe.dist <- vegdist(spe, method = "bray")
+#   rdacca.hp(spe.dist, env, method = "dbRDA", type = "adjR2")
+#   permu.hp(spe.dist, env, method = "dbRDA")
+# ------------------------------------------------------------
 
-    # =========================
-    # 对应 R:
-    # data(doubs)
-    # spe <- doubs$fish
-    # env <- doubs$env
-    # =========================
-    spe = pd.read_csv("doubs_fish.csv", index_col=0)
-    env = pd.read_csv("doubs_env.csv", index_col=0)
+spe = pd.read_csv("doubs_fish.csv", index_col=0)
+env = pd.read_csv("doubs_env.csv", index_col=0)
 
-    print("\n=== original shapes ===")
-    print("spe:", spe.shape)
-    print("env:", env.shape)
+spe = spe.apply(pd.to_numeric, errors="raise")
+env = env.apply(pd.to_numeric, errors="raise")
 
-    # =========================
-    # 对应 R:
-    # spe <- spe[-8, ]
-    # env <- env[-8, ]
-    # =========================
-    spe = spe.drop(spe.index[7])
-    env = env.drop(env.index[7])
+# R is 1-based: spe[-8, ]; Python position 7 is the 8th row.
+spe = spe.drop(spe.index[7])
+env = env.drop(env.index[7])
 
-    # =========================
-    # 对应 R:
-    # env <- env[, -1]
-    # 删除 dfs
-    # =========================
-    env = env.iloc[:, 1:].copy()
+# R: env <- env[, -1]  # remove dfs
+env = env.drop(columns=["dfs"], errors="raise")
 
-    print("\n=== processed shapes ===")
-    print("spe:", spe.shape)
-    print("env:", env.shape)
-    print("\n=== env columns ===")
-    print(env.columns.tolist())
+if not spe.index.equals(env.index):
+    raise ValueError("spe and env row indices do not match after preprocessing.")
 
-    # =========================
-    # 对应 R:
-    # spe.dist <- vegdist(spe, method = "bray")
-    # =========================
-    spe_dist = pairwise_distances(spe, metric="braycurtis")
+# R: vegdist(spe, method = "bray") returns a condensed distance vector.
+spe_dist = pdist(spe.to_numpy(dtype=float), metric="braycurtis")
 
-    spe_dist_df = pd.DataFrame(
-        spe_dist,
-        index=spe.index,
-        columns=spe.index,
-    )
+print("=== Bray-Curtis condensed distance vector ===")
+print("n sites:", spe.shape[0])
+print("vector length:", len(spe_dist))
+print("expected length:", spe.shape[0] * (spe.shape[0] - 1) // 2)
 
-    # =========================
-    # 对应 R:
-    # spe.hp.dbrda <- rdacca.hp(
-    #   spe.dist,
-    #   env,
-    #   method = "dbRDA",
-    #   type = "adjR2"
-    # )
-    # print(spe.hp.dbrda)
-    # =========================
-    result = run_rdacca_hp(
-        dv=spe_dist_df,
-        iv=env,
-        method="dbRDA",
-        type="adjR2",
-        scale=False,
-        var_part=True,
-    )
+start = time.perf_counter()
+spe_hp_dbrda = rdacca_hp(
+    dv=spe_dist,
+    iv=env,
+    method="dbRDA",
+    type="adjR2",
+    scale=False,
+    var_part=True,
+)
+mid = time.perf_counter()
 
-    print("\n==============================")
-    print("Python rdacca_hp dbRDA result")
-    print("==============================")
+print("\n=== dbRDA rdacca_hp result ===")
+print("Total explained variation:")
+print(spe_hp_dbrda.total_explained_variation)
+print("\nHierarchical partitioning:")
+print(spe_hp_dbrda.hier_part)
+print("\nVariation partitioning:")
+print(spe_hp_dbrda.var_part)
+print(f"\nrdacca_hp dbRDA time: {mid - start:.3f} seconds")
 
-    print("\n=== Method Type ===")
-    print(result.method_type)
+perm_start = time.perf_counter()
+perm_dbrda = permu_hp(
+    dv=spe_dist,
+    iv=env,
+    method="dbRDA",
+    type="adjR2",
+    permutations=1000,  # R-style: 999 randomized runs + 1 observed value
+    scale=False,
+    verbose=True,
+    random_state=None,
+)
+perm_end = time.perf_counter()
 
-    print("\n=== Total Explained Variation ===")
-    print(result.total_explained_variation)
-
-    print("\n=== Hierarchical Partitioning ===")
-    print(result.hier_part)
-
-    print("\n=== Variation Partitioning ===")
-    print(result.var_part)
-
-    # =========================
-    # 额外诊断：
-    # 直接计算全模型 dbRDA adjR2
-    # 对应 vegan::capscale + RsquareAdj 的全模型 adjR2
-    # =========================
-    direct_full_adjR2 = calculate_dbrda(
-        dv_dist=spe_dist,
-        iv=env.to_numpy(dtype=float),
-        type="adjR2",
-        add=False,
-        sqrt_dist=False,
-        n_axes=None,
-    )
-
-    direct_full_R2 = calculate_dbrda(
-        dv_dist=spe_dist,
-        iv=env.to_numpy(dtype=float),
-        type="R2",
-        add=False,
-        sqrt_dist=False,
-        n_axes=None,
-    )
-
-    print("\n==============================")
-    print("Direct full-model dbRDA check")
-    print("==============================")
-    print("Direct full-model adjR2:", direct_full_adjR2)
-    print("Direct full-model R2:    ", direct_full_R2)
-
-
-if __name__ == "__main__":
-    main()
+print("\n=== dbRDA permutation test result ===")
+print(perm_dbrda)
+print(f"\npermu_hp dbRDA time: {perm_end - perm_start:.3f} seconds")

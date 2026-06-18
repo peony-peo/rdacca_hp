@@ -4,7 +4,7 @@ from typing import Union, List, Dict
 import time
 
 from .core import rdacca_hp, _rdacca_hp_multi, _rdacca_hp_single
-from .utils import sanitize_tabular_input, preprocess_predictor_dataframe
+from .utils import sanitize_tabular_input, preprocess_predictor_dataframe, coerce_distance_input
 
 
 def _build_permutation_engine(iv, method, type, scale, n_perm, add, sqrt_dist, n_axes,
@@ -77,7 +77,7 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
              iv: Union[np.ndarray, pd.DataFrame, List, Dict],
              method: str = "RDA",
              type: str = "adjR2",
-             permutations: int = 999,
+             permutations: int = 1000,
              scale: bool = False,
              n_perm: int = 1000,          # for CCA adjR2
              add: bool = False,           # for dbRDA
@@ -91,11 +91,12 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
     """
     Permutation test for hierarchical partitioning.
 
-    Notes
-    -----
-    - 对 DataFrame 输入：逐列独立置换（与 R 单表分支意图一致）
-    - 对 dict/list 分组输入：每个组内部按同一个行置换同步打乱
-    - 会保留 DataFrame 结构，避免列名/类型丢失
+    This follows rdacca.hp::permu.hp semantics:
+    - ``permutations`` is the total number of values used for the empirical distribution.
+    - The observed value is included once, so only ``permutations - 1`` randomized runs
+      are performed.
+    - For DataFrame input, each original predictor is permuted independently.
+    - For dict/list grouped input, all groups are permuted using the same row order.
     """
 
     method = method.upper()
@@ -105,15 +106,30 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
     if type not in {"R2", "adjR2"}:
         raise ValueError("type must be 'R2' or 'adjR2'")
 
+    permutations = int(permutations)
+    if permutations < 2:
+        raise ValueError("permutations must be at least 2")
+
     ordered_factors = ordered_factors or {}
     categorical_factors = categorical_factors or []
     rng = np.random.default_rng(random_state)
 
     dv = sanitize_tabular_input(dv, warn=verbose)
     iv = sanitize_tabular_input(iv, warn=verbose)
+    iv_is_dataframe_input = isinstance(iv, pd.DataFrame)
+
+    # Internal optimized evaluators (_rdacca_hp_multi/_rdacca_hp_single) do not
+    # run the public rdacca_hp() dbRDA input coercion step.  Therefore, when dbRDA
+    # receives an R-like condensed distance vector, convert it once here to a
+    # square distance matrix for all permutation runs.  This keeps the optimized
+    # loop while preventing a condensed vector of length n*(n-1)/2 from being
+    # mistaken for n samples inside lower-level checks.
+    dv_for_permutation = coerce_distance_input(dv) if method == "DBRDA" else dv
+
+    n_random = permutations - 1
 
     if verbose:
-        print(f"Running permutation test with {permutations} permutations...")
+        print(f"Please wait: running {n_random} permutations")
         start_time = time.perf_counter()
 
     # ---- observed result ----
@@ -152,20 +168,25 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
     )
 
     # ---- initialize ----
-    perm_individual = np.full((permutations, n_vars), np.nan, dtype=float)
+    perm_individual = np.full((n_random, n_vars), np.nan, dtype=float)
     failed_perms = 0
 
-    n_samples = _infer_n_samples(dv, perm_base_iv)
+    # Always infer n from the explanatory variables, not from dv.
+    # This is essential for dbRDA when dv is a condensed distance vector.
+    n_samples = _infer_n_samples(dv_for_permutation, perm_base_iv)
 
     # ---- permutation loop ----
-    for i in range(permutations):
+    for i in range(n_random):
         if verbose and (i + 1) % 100 == 0:
-            print(f"  Completed {i + 1}/{permutations} permutations")
+            print(f"  Completed {i + 1}/{n_random} permutations")
 
-        permuted_iv = _permute_variables(perm_base_iv, n_samples, rng)
+        if iv_is_dataframe_input and isinstance(perm_base_iv, dict):
+            permuted_iv = _permute_grouped_dict_independently(perm_base_iv, n_samples, rng)
+        else:
+            permuted_iv = _permute_variables(perm_base_iv, n_samples, rng)
 
         try:
-            perm_result = perm_engine(dv, permuted_iv)
+            perm_result = perm_engine(dv_for_permutation, permuted_iv)
             perm_individual[i, :] = perm_result.hier_part["Individual"].to_numpy(dtype=float)
 
         except Exception as e:
@@ -175,7 +196,7 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
 
     # ---- summarize failures ----
     if verbose:
-        print(f"Failed permutations: {failed_perms}/{permutations}")
+        print(f"Failed permutations: {failed_perms}/{n_random}")
 
     valid_mask = ~np.isnan(perm_individual).any(axis=1)
     valid_perm = perm_individual[valid_mask]
@@ -190,7 +211,7 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
     p_values = _calculate_p_values(
         obs_values=obs_individual,
         perm_values=valid_perm,
-        n_perm=valid_perm.shape[0]
+        n_perm=valid_perm.shape[0] + 1,
     )
 
     result_df = _create_result_dataframe(obs_result, p_values)
@@ -204,14 +225,12 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
 
 def _infer_n_samples(dv, iv) -> int:
     """
-    Infer sample size from dv first, then iv.
+    Infer sample size from iv first, then dv.
+
+    Permutation is applied to explanatory variables, so iv is the reliable source
+    of sample size. This also prevents a dbRDA condensed distance vector of length
+    n * (n - 1) / 2 from being mistaken for n samples.
     """
-    if isinstance(dv, pd.DataFrame):
-        return dv.shape[0]
-
-    if isinstance(dv, np.ndarray):
-        return dv.shape[0]
-
     if isinstance(iv, pd.DataFrame):
         return iv.shape[0]
 
@@ -223,8 +242,50 @@ def _infer_n_samples(dv, iv) -> int:
         first = iv[0]
         return first.shape[0] if hasattr(first, "shape") else len(first)
 
-    arr = np.asarray(iv)
-    return arr.shape[0]
+    if iv is not None:
+        arr = np.asarray(iv)
+        if arr.ndim >= 1:
+            return arr.shape[0]
+
+    if isinstance(dv, pd.DataFrame):
+        return dv.shape[0]
+
+    if isinstance(dv, np.ndarray):
+        arr = np.asarray(dv)
+        if arr.ndim == 2:
+            return arr.shape[0]
+
+    raise ValueError("Cannot infer sample size from inputs.")
+
+
+def _permute_dataframe_rows(df: pd.DataFrame, perms: np.ndarray) -> pd.DataFrame:
+    return df.iloc[perms].reset_index(drop=True)
+
+
+def _permute_array_rows(value, perms: np.ndarray):
+    arr = np.asarray(value)
+    if arr.ndim == 1:
+        return arr[perms]
+    return arr[perms, :]
+
+
+def _permute_grouped_dict_independently(iv: Dict, n_samples: int, rng) -> Dict:
+    """
+    Permute each logical predictor group independently.
+
+    Used for original DataFrame input after one-time factor encoding. A categorical
+    variable expanded to multiple dummy columns stays together within its group,
+    but different original variables receive different permutations, matching the
+    data.frame branch of rdacca.hp::permu.hp.
+    """
+    out = {}
+    for k, v in iv.items():
+        perms = rng.permutation(n_samples)
+        if isinstance(v, pd.DataFrame):
+            out[k] = _permute_dataframe_rows(v, perms)
+        else:
+            out[k] = _permute_array_rows(v, perms)
+    return out
 
 
 def _permute_dataframe_columns(df: pd.DataFrame, n_samples: int, rng) -> pd.DataFrame:
@@ -273,36 +334,28 @@ def _permute_variables(
     if rng is None:
         rng = np.random.default_rng()
 
-    # ---- grouped dict input ----
+    # ---- grouped dict input: synchronized row permutation across groups ----
     if isinstance(iv, dict):
         perms = rng.permutation(n_samples)
         out = {}
 
         for k, v in iv.items():
             if isinstance(v, pd.DataFrame):
-                out[k] = v.iloc[perms].reset_index(drop=True)
+                out[k] = _permute_dataframe_rows(v, perms)
             else:
-                arr = np.asarray(v)
-                if arr.ndim == 1:
-                    out[k] = arr[perms]
-                else:
-                    out[k] = arr[perms, :]
+                out[k] = _permute_array_rows(v, perms)
         return out
 
-    # ---- grouped list input ----
+    # ---- grouped list input: synchronized row permutation across groups ----
     if isinstance(iv, list):
         perms = rng.permutation(n_samples)
         out = []
 
         for v in iv:
             if isinstance(v, pd.DataFrame):
-                out.append(v.iloc[perms].reset_index(drop=True))
+                out.append(_permute_dataframe_rows(v, perms))
             else:
-                arr = np.asarray(v)
-                if arr.ndim == 1:
-                    out.append(arr[perms])
-                else:
-                    out.append(arr[perms, :])
+                out.append(_permute_array_rows(v, perms))
         return out
 
     # ---- single DataFrame input ----
@@ -315,16 +368,27 @@ def _permute_variables(
 
 def _calculate_p_values(obs_values: np.ndarray,
                         perm_values: np.ndarray,
-                        n_perm: int) -> np.ndarray:
+                        n_perm: int | None = None) -> np.ndarray:
     """
-    Calculate p-values from valid permutation results only.
-    """
-    n_vars = len(obs_values)
-    p_values = np.zeros(n_vars, dtype=float)
+    Calculate p-values using the rdacca.hp::permu.hp ECDF formula.
 
-    for i in range(n_vars):
-        count = np.sum(perm_values[:, i] >= obs_values[i])
-        p_values[i] = (count + 1) / (n_perm + 1)
+    ``n_perm`` is the total permutations argument, including the observed value.
+    If omitted, it is inferred as one observed value plus the number of valid
+    randomized runs.
+    """
+    obs_values = np.asarray(obs_values, dtype=float)
+    perm_values = np.asarray(perm_values, dtype=float)
+
+    total_permutations = int(n_perm) if n_perm is not None else perm_values.shape[0] + 1
+    decimals = len(str(total_permutations))
+
+    p_values = np.zeros(len(obs_values), dtype=float)
+
+    for i in range(len(obs_values)):
+        x = np.concatenate(([obs_values[i]], perm_values[:, i]))
+        ecdf_at_obs = np.mean(x <= obs_values[i])
+        p = 1.0 - ecdf_at_obs + 1.0 / (total_permutations + 1.0)
+        p_values[i] = round(float(p), decimals)
 
     return p_values
 
@@ -341,15 +405,13 @@ def _create_result_dataframe(obs_result, p_values: np.ndarray) -> pd.DataFrame:
 
 def _format_significance(p_value: float) -> str:
     """
-    Convert p-value to significance stars.
+    Convert p-value to significance stars, following rdacca.hp::permu.hp.
     """
-    if p_value < 0.001:
+    if p_value <= 0.001:
         return "***"
-    elif p_value < 0.01:
+    elif p_value <= 0.01:
         return "**"
-    elif p_value < 0.05:
+    elif p_value <= 0.05:
         return "*"
-    elif p_value < 0.1:
-        return "."
     else:
         return ""

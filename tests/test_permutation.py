@@ -37,7 +37,7 @@ def test_permute_variables_preserves_grouped_dict_structure():
     assert out["g2"].shape == (3, 2)
 
 
-def test_calculate_p_values_matches_expected_formula():
+def test_calculate_p_values_matches_r_style_ecdf_formula():
     obs = np.array([0.5, 0.2])
     perm = np.array([
         [0.4, 0.1],
@@ -47,8 +47,13 @@ def test_calculate_p_values_matches_expected_formula():
 
     p = _calculate_p_values(obs, perm, n_perm=3)
 
-    np.testing.assert_allclose(p, np.array([(2 + 1) / 4, (2 + 1) / 4]))
+    expected = []
+    for j in range(len(obs)):
+        x = np.concatenate(([obs[j]], perm[:, j]))
+        ecdf_at_obs = np.mean(x <= obs[j])
+        expected.append(1 - ecdf_at_obs + 1 / (perm.shape[0] + 1))
 
+    np.testing.assert_allclose(p, np.array(expected))
 
 def test_permu_hp_returns_expected_columns_for_rda():
     dv, iv = create_test_data(n_samples=40, n_predictors=3, n_responses=2, seed=10)
