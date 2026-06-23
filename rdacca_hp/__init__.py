@@ -4,7 +4,13 @@ Python implementation of the R package for hierarchical partitioning in canonica
 """
 
 from .core import rdacca_hp, RdaccaHpResult, calculate_rda, calculate_cca, calculate_dbrda
-from .utils import create_test_data, create_cca_test_data, create_distance_test_data
+from .utils import (
+    VEGAN_DISTANCE_METHODS,
+    calculate_distance_matrix,
+    create_test_data,
+    create_cca_test_data,
+    create_distance_test_data,
+)
 
 # Import permutation functions
 try:
@@ -30,7 +36,7 @@ except ImportError as e:
         """Comparison plotting function - not available"""
         raise NotImplementedError("Comparison plotting functionality not available")
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 __author__ = "Jiangshan Lai"
 __email__ = "lai@njfu.edu.cn"
 
@@ -40,6 +46,8 @@ __all__ = [
     'calculate_rda',
     'calculate_cca',
     'calculate_dbrda',
+    'calculate_distance_matrix',
+    'VEGAN_DISTANCE_METHODS',
     'create_test_data',
     'create_cca_test_data',
     'create_distance_test_data',

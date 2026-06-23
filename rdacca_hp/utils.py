@@ -4,6 +4,25 @@ from typing import List, Union, Tuple
 from sklearn.metrics import pairwise_distances
 from scipy.spatial.distance import squareform
 
+
+VEGAN_DISTANCE_METHODS = (
+    "bray",
+    "euclidean",
+    "manhattan",
+    "canberra",
+    "jaccard",
+    "kulczynski",
+    "gower",
+    "hellinger",
+    "chord",
+)
+
+_DISTANCE_ALIASES = {
+    "braycurtis": "bray",
+    "bray-curtis": "bray",
+    "cityblock": "manhattan",
+}
+
 def _is_strict_sequential_index(series: pd.Series) -> bool:
     """
     判断一列是否像典型导出索引列：
@@ -741,36 +760,25 @@ def euclidify_distance_matrix(distance_matrix: np.ndarray, method: str = "lingoe
             return np.sqrt(new_D_sq)
 
     elif method == "cailliez":
-        # Cailliez method: add constant to all elements
+        # Match vegan::addCailliez.
         n = distance_matrix.shape[0]
 
-        # Create matrices for the Cailliez method
-        A = -0.5 * distance_matrix ** 2
-        I = np.eye(n)
-        ones = np.ones((n, n))
+        def gower_double_center(matrix):
+            return (
+                matrix
+                - np.mean(matrix, axis=0, keepdims=True)
+                - np.mean(matrix, axis=1, keepdims=True)
+                + np.mean(matrix)
+            )
 
-        # Construct the matrix for the eigenvalue problem
-        M = np.block([
-            [A @ (I - ones/n), -I],
-            [-(I - ones/n) @ A @ (I - ones/n), (I - ones/n) @ A]
-        ])
+        z = np.zeros((2 * n, 2 * n), dtype=float)
+        z[n:, :n] = -np.eye(n)
+        z[:n, n:] = -gower_double_center(distance_matrix ** 2)
+        z[n:, n:] = gower_double_center(2.0 * distance_matrix)
 
-        # Find eigenvalues
-        eigenvalues = np.linalg.eigvals(M)
-        real_eigenvalues = eigenvalues[np.isreal(eigenvalues)].real
-
-        if len(real_eigenvalues) == 0:
-            # Fallback to Lingoes method
-            return euclidify_distance_matrix(distance_matrix, method="lingoes")
-
-        constant = np.max(real_eigenvalues)
-
-        if constant <= 0:
-            # Already Euclidean
-            return distance_matrix
-        else:
-            # Add constant
-            return distance_matrix + constant * (1 - np.eye(n))
+        eigenvalues = np.linalg.eigvals(z)
+        constant = max(float(np.max(eigenvalues.real)), 0.0)
+        return distance_matrix + constant * (1 - np.eye(n))
 
     else:
         raise ValueError("Method must be 'lingoes' or 'cailliez'")
@@ -802,6 +810,125 @@ def is_condensed_distance_vector(x: np.ndarray) -> bool:
         return False
 
     return n_int * (n_int - 1) // 2 == m
+
+
+def calculate_distance_matrix(response_data, method: str = "bray") -> np.ndarray:
+    """Calculate a sample-by-sample dissimilarity matrix from raw response data.
+
+    The method names follow commonly used ``vegan::vegdist`` names. Rows are
+    samples and columns are response variables (for example, species).
+    """
+    if isinstance(response_data, pd.DataFrame):
+        data = response_data.to_numpy(dtype=float)
+    else:
+        data = np.asarray(response_data, dtype=float)
+
+    if data.ndim != 2:
+        raise ValueError("Raw db-RDA response data must be a two-dimensional matrix.")
+    if data.shape[0] < 2:
+        raise ValueError("Raw db-RDA response data must contain at least two samples.")
+    if data.shape[1] < 1:
+        raise ValueError("Raw db-RDA response data must contain at least one response variable.")
+    if not np.all(np.isfinite(data)):
+        raise ValueError("NA/NaN/Inf is not allowed in db-RDA response data.")
+
+    method_key = str(method).strip()
+    method_key = _DISTANCE_ALIASES.get(method_key.lower(), method_key.lower())
+    if method_key not in VEGAN_DISTANCE_METHODS:
+        supported = ", ".join(VEGAN_DISTANCE_METHODS)
+        raise ValueError(f"Unsupported distance method '{method}'. Supported methods: {supported}.")
+
+    if method_key in {"bray", "jaccard", "kulczynski", "hellinger", "chord"}:
+        if np.any(data < 0):
+            raise ValueError(f"Distance method '{method_key}' requires non-negative response data.")
+
+    if method_key == "hellinger":
+        row_sums = data.sum(axis=1)
+        if np.any(row_sums <= 0):
+            raise ValueError("Hellinger distance cannot be calculated for empty samples.")
+        transformed = np.sqrt(data / row_sums[:, None])
+        return pairwise_distances(transformed, metric="euclidean")
+
+    if method_key == "chord":
+        row_norms = np.linalg.norm(data, axis=1)
+        if np.any(row_norms <= 0):
+            raise ValueError("Chord distance cannot be calculated for empty samples.")
+        transformed = data / row_norms[:, None]
+        return pairwise_distances(transformed, metric="euclidean")
+
+    if method_key == "gower":
+        ranges = np.ptp(data, axis=0)
+        active = ranges > 0
+        if not np.any(active):
+            return np.zeros((data.shape[0], data.shape[0]), dtype=float)
+        scaled = data[:, active] / ranges[active]
+        return pairwise_distances(scaled, metric="manhattan") / int(np.sum(active))
+
+    if method_key == "euclidean":
+        return pairwise_distances(data, metric="euclidean")
+    if method_key == "manhattan":
+        return pairwise_distances(data, metric="manhattan")
+    if method_key == "canberra":
+        n_samples = data.shape[0]
+        distances = np.zeros((n_samples, n_samples), dtype=float)
+        for i in range(n_samples):
+            xi = data[i]
+            for j in range(i + 1, n_samples):
+                xj = data[j]
+                denominator = np.abs(xi) + np.abs(xj)
+                active = denominator > 0
+                value = (
+                    0.0
+                    if not np.any(active)
+                    else float(np.mean(np.abs(xi[active] - xj[active]) / denominator[active]))
+                )
+                distances[i, j] = distances[j, i] = value
+        return distances
+
+    n_samples = data.shape[0]
+    distances = np.zeros((n_samples, n_samples), dtype=float)
+    for i in range(n_samples):
+        xi = data[i]
+        for j in range(i + 1, n_samples):
+            xj = data[j]
+            abs_sum = float(np.sum(np.abs(xi - xj)))
+            total_sum = float(np.sum(xi + xj))
+
+            if method_key == "bray":
+                value = np.nan if total_sum == 0 else abs_sum / total_sum
+            elif method_key == "jaccard":
+                bray = np.nan if total_sum == 0 else abs_sum / total_sum
+                value = 2.0 * bray / (1.0 + bray)
+            else:  # kulczynski
+                minimum_sum = float(np.sum(np.minimum(xi, xj)))
+                xi_sum = float(np.sum(xi))
+                xj_sum = float(np.sum(xj))
+                value = (
+                    np.nan
+                    if xi_sum == 0 or xj_sum == 0
+                    else 1.0 - 0.5 * (minimum_sum / xi_sum + minimum_sum / xj_sum)
+                )
+
+            distances[i, j] = distances[j, i] = value
+
+    if not np.all(np.isfinite(distances)):
+        raise ValueError(
+            f"Distance method '{method_key}' produced NaN or Inf; "
+            "check for empty or otherwise invalid samples."
+        )
+    return distances
+
+
+def prepare_dbrda_response(dv, distance: str | None = None) -> np.ndarray:
+    """Prepare db-RDA response data while preserving the legacy distance input.
+
+    ``distance=None`` means that ``dv`` is already a square distance matrix or
+    condensed distance vector. Supplying a method means that ``dv`` is a raw
+    response matrix and distances are calculated inside the package.
+    """
+    if distance is None:
+        return coerce_distance_input(dv)
+    return calculate_distance_matrix(dv, method=distance)
 
 
 def coerce_distance_input(distance_input: np.ndarray) -> np.ndarray:
@@ -1189,7 +1316,7 @@ def test_utils():
     # Test db-RDA specific functions
     test_dbrda_utils()
 
-    print("All utility function tests passed! 🎉")
+    print("All utility function tests passed! ")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,12 @@
 import numpy as np
 import pandas as pd
+import pytest
+
+import rdacca_hp.permutation as permutation_module
 
 from rdacca_hp.permutation import (
     _calculate_p_values,
+    _format_r_p_value,
     _permute_variables,
     permu_hp,
 )
@@ -45,15 +49,22 @@ def test_calculate_p_values_matches_r_style_ecdf_formula():
         [0.5, 0.3],
     ])
 
-    p = _calculate_p_values(obs, perm, n_perm=3)
+    p = _calculate_p_values(obs, perm, n_perm=4)
 
     expected = []
     for j in range(len(obs)):
         x = np.concatenate(([obs[j]], perm[:, j]))
         ecdf_at_obs = np.mean(x <= obs[j])
-        expected.append(1 - ecdf_at_obs + 1 / (perm.shape[0] + 1))
+        expected.append(1 - ecdf_at_obs + 1 / (perm.shape[0] + 2))
 
-    np.testing.assert_allclose(p, np.array(expected))
+    np.testing.assert_allclose(p, np.round(np.array(expected), 1))
+
+
+def test_r_style_p_value_formatting():
+    assert _format_r_p_value(0.001) == "0.001 ***"
+    assert _format_r_p_value(0.01) == "0.01  **"
+    assert _format_r_p_value(0.05) == "0.05   *"
+    assert _format_r_p_value(0.1) == "0.1    "
 
 def test_permu_hp_returns_expected_columns_for_rda():
     dv, iv = create_test_data(n_samples=40, n_predictors=3, n_responses=2, seed=10)
@@ -69,10 +80,43 @@ def test_permu_hp_returns_expected_columns_for_rda():
         random_state=123,
     )
 
-    expected_cols = ["Unique", "Average.share", "Individual", "I.perc(%)", "Pr(>I)", "Significance"]
+    expected_cols = ["Individual", "Pr(>I)"]
     assert list(result.columns) == expected_cols
     assert result.shape[0] == 3
-    assert ((result["Pr(>I)"] >= 0) & (result["Pr(>I)"] <= 1)).all()
+    assert result["Pr(>I)"].map(lambda value: isinstance(value, str)).all()
+
+
+def test_permu_hp_stops_on_failed_permutation_by_default(monkeypatch):
+    dv, iv = create_test_data(
+        n_samples=20,
+        n_predictors=2,
+        n_responses=2,
+        seed=12,
+    )
+    iv_df = pd.DataFrame(iv, columns=["A", "B"])
+
+    def fake_build_permutation_engine(**kwargs):
+        def fail(_dv, _iv):
+            raise ValueError("forced permutation failure")
+
+        return kwargs["iv"], fail
+
+    monkeypatch.setattr(
+        permutation_module,
+        "_build_permutation_engine",
+        fake_build_permutation_engine,
+    )
+
+    with pytest.raises(ValueError, match="forced permutation failure"):
+        permu_hp(
+            dv=dv,
+            iv=iv_df,
+            method="RDA",
+            type="R2",
+            permutations=3,
+            verbose=False,
+            random_state=12,
+        )
 
 
 def test_permu_hp_is_reproducible_given_random_state():
@@ -100,6 +144,31 @@ def test_permu_hp_is_reproducible_given_random_state():
     )
 
     pd.testing.assert_frame_equal(r1, r2)
+
+
+def test_permu_hp_cca_adjusted_r2_is_reproducible_given_random_state():
+    rng = np.random.default_rng(2026)
+    dv = rng.poisson(3.0, size=(28, 5)).astype(float)
+    iv = pd.DataFrame(
+        rng.normal(size=(28, 2)),
+        columns=["Environment", "Space"],
+    )
+    kwargs = dict(
+        dv=dv,
+        iv=iv,
+        method="CCA",
+        type="adjR2",
+        permutations=7,
+        n_perm=19,
+        verbose=False,
+        random_state=707,
+    )
+
+    first = permu_hp(**kwargs)
+    second = permu_hp(**kwargs)
+
+    pd.testing.assert_frame_equal(first, second)
+    assert first["Pr(>I)"].map(lambda value: isinstance(value, str)).all()
 
 
 def test_permu_hp_runs_with_categorical_and_ordered_predictors():

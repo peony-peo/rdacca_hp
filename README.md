@@ -34,35 +34,42 @@ The package also provides:
   * grouped predictors
 * Permutation testing with `permu_hp()`
 * Plotting utilities for single results and result comparison
-* Baseline validation against R outputs for key RDA use cases
-* dbRDA support for both:
+* Baseline validation against R `rdacca.hp` and `vegan` outputs for RDA, CCA, and dbRDA
+* dbRDA support for:
 
+  * raw response matrices with package-level distance calculation
   * square symmetric distance matrices
   * condensed / dist-style distance input
+* Vegan-compatible distance methods: `bray`, `euclidean`, `manhattan`, `canberra`,
+  `jaccard`, `kulczynski`, `gower`, `hellinger`, and `chord`
 
 ---
 
 ## Current status
 
-This package is currently in an early public release stage.
+Version `0.1.5` is a compatibility and validation release focused on alignment
+with R `rdacca.hp` 1.1-3 and `vegan` 2.6-8.
 
 At the current stage:
 
-* the **RDA** workflow has been checked carefully against the R package **rdacca.hp**
+* **RDA**, **CCA**, and **dbRDA** workflows have R baseline coverage
 * mixed predictor inputs (numeric + unordered factor + ordered factor) are supported
-* permutation testing is available
-* dbRDA supports both full distance matrices and condensed distance input
-* baseline tests against R outputs are included for selected cases
+* grouped predictors are supported for the main analysis and permutation testing
+* CCA adjusted R-squared follows `vegan::RsquareAdj.cca`
+* permutation testing follows R `permu.hp()` semantics and output structure
+* dbRDA accepts raw responses, full distance matrices, and condensed distance input
 
 Notes:
 
-* results for **RDA** are expected to closely match the R implementation in validated scenarios
-* **CCA** and **dbRDA** are implemented and tested, and further benchmark expansion is planned in future releases
+* deterministic RDA, CCA R2, and dbRDA results match the validated R references
+* CCA adjusted R-squared is checked against R with Monte Carlo tolerances
 * permutation p-values may show small Monte Carlo differences relative to R because random permutation sequences differ across platforms
 
 ---
 
 ## Installation
+
+Python 3.10 or later is required.
 
 ### Install from local source
 
@@ -105,6 +112,8 @@ Main public objects include:
 * `calculate_rda`
 * `calculate_cca`
 * `calculate_dbrda`
+* `calculate_distance_matrix`
+* `VEGAN_DISTANCE_METHODS`
 * `create_test_data`
 * `create_cca_test_data`
 * `create_distance_test_data`
@@ -217,7 +226,35 @@ perm_result = permu_hp(
 print(perm_result)
 ```
 
-### 5. dbRDA with a square distance matrix
+The returned table follows R `permu.hp()` and contains `Individual` and
+`Pr(>I)`. The p-value column is character data because significance stars are
+included in the same field.
+
+### 5. dbRDA from a raw response matrix
+
+```python
+from rdacca_hp import create_cca_test_data, rdacca_hp
+
+community, iv = create_cca_test_data(
+    n_samples=30,
+    n_predictors=3,
+    n_species=10,
+    seed=123,
+)
+
+result = rdacca_hp(
+    dv=community,
+    iv=iv,
+    method="dbRDA",
+    type="adjR2",
+    distance="bray",
+    var_part=True,
+)
+
+print(result.hier_part)
+```
+
+### 6. dbRDA with a square distance matrix
 
 ```python
 from rdacca_hp import create_distance_test_data, create_test_data, rdacca_hp
@@ -238,7 +275,7 @@ result = rdacca_hp(
 print(result.hier_part)
 ```
 
-### 6. dbRDA with condensed / dist-style input
+### 7. dbRDA with condensed / dist-style input
 
 ```python
 from scipy.spatial.distance import squareform
@@ -259,7 +296,7 @@ result = rdacca_hp(
 print(result.hier_part)
 ```
 
-### 7. Plotting
+### 8. Plotting
 
 ```python
 from rdacca_hp import create_test_data, rdacca_hp, plot_rdaccahp
@@ -286,7 +323,8 @@ Main function for hierarchical partitioning and variation partitioning.
 
 ### `permu_hp()`
 
-Permutation test for hierarchical partitioning results.
+Permutation test for hierarchical partitioning results. Its output follows R
+`permu.hp()` with the columns `Individual` and `Pr(>I)`.
 
 ### `plot_rdaccahp()`
 
@@ -311,6 +349,7 @@ For **RDA**, users often apply Hellinger transformation before analysis when wor
 
 For **dbRDA**, `dv` can be either:
 
+* a raw response matrix when `distance` is specified
 * a square symmetric distance matrix
 * a valid condensed / dist-style distance vector
 
@@ -455,7 +494,11 @@ pytest --cov=rdacca_hp --cov-report=term-missing
 Run only R baseline tests:
 
 ```bash
-pytest tests/test_r_baselines.py -q
+pytest tests/test_r_baselines.py \
+  tests/test_cca_r2_r_baselines.py \
+  tests/test_cca_adjr2_r_baselines.py \
+  tests/test_dbrda_r_baselines.py \
+  tests/test_dbrda_options_r_baselines.py -q
 ```
 
 Run dbRDA-specific tests:
@@ -475,15 +518,37 @@ This project includes a benchmark workflow against R outputs.
 * `benchmark/data/`: fixed input data
 * `benchmark/expected/`: expected outputs exported from R
 * `benchmark/r_scripts/`: scripts used to generate expected R outputs
+* `benchmark/cca_r2_reference/`: CCA R2 references
+* `benchmark/cca_adjr2_reference/`: CCA adjusted R2 references
+* `benchmark/dbrda_reference/`: distance and grouped dbRDA references
+* `benchmark/dbrda_options_reference/`: dbRDA correction and engine references
 
-### Current validated RDA baselines
+### Current validated baselines
+
+RDA:
 
 * `rda_numeric_2vars`
 * `rda_unordered_factor`
 * `rda_mite_full_mixed`
 * `rda_ordered_factor_mixed`
 
-These baselines are used to check that Python results remain aligned with the corresponding R workflow for validated RDA scenarios.
+CCA:
+
+* numeric predictors
+* mixed environmental predictors with factors
+* grouped predictors
+* R2 and permutation-adjusted R2
+
+dbRDA:
+
+* nine vegan-style distance methods
+* raw and precomputed distance equivalence
+* grouped predictors
+* `dbrda` and `capscale` engines
+* square-root, Lingoes, and Cailliez corrections
+
+These references check that Python results remain aligned with the corresponding
+R workflow in the validated scenarios.
 
 ---
 
@@ -517,20 +582,37 @@ pd.read_csv("file.csv", keep_default_na=False)
 
 For dbRDA, the response can now be supplied either as:
 
+* a raw response matrix with `distance=...`,
 * a full square symmetric distance matrix, or
 * a condensed / dist-style distance vector
 
 This is intended to make the Python workflow closer to the flexibility of R-style distance input.
 
-For dbRDA, rdacca_hp uses dbrdatype="dbrda" by default, matching rdacca.hp >= 1.1.3 in R. 
-Users can set dbrdatype="capscale" to use the capscale-style calculation.
+For dbRDA, `rdacca_hp` uses `dbrdatype="dbrda"` by default, matching
+`rdacca.hp` >= 1.1.3 in R. Users can set `dbrdatype="capscale"` to use the
+capscale-style calculation.
+
+When raw responses are supplied, supported distance methods are `bray`,
+`euclidean`, `manhattan`, `canberra`, `jaccard`, `kulczynski`, `gower`,
+`hellinger`, and `chord`.
+
+### 5. CCA permutation count
+
+Python honors the `n_perm` argument when calculating CCA adjusted R-squared.
+In R `rdacca.hp` 1.1-3, this argument is passed to `cca()` rather than directly
+to `RsquareAdj.cca()`, so the effective R calculation still uses vegan's
+default of 1000 permutations. The Python behavior follows the documented intent
+of the argument.
+
 ---
 
 ## Limitations
 
-* RDA is currently the most thoroughly validated workflow
-* CCA and dbRDA are available, but more benchmark expansion is still desirable
-* very large permutation jobs may be slow in pure Python workflows
+* R baseline coverage validates selected public datasets and parameter combinations,
+  not every possible dataset or degenerate model
+* the number of model subsets grows as `2^N - 1`, so analyses with many predictors
+  can require substantial time and memory
+* large nested CCA permutation analyses remain computationally intensive
 
 ---
 
@@ -561,7 +643,11 @@ rdacca_hp/
 │   ├── test_assertions.py
 │   ├── test_core.py
 │   ├── test_cca.py
+│   ├── test_cca_r2_r_baselines.py
+│   ├── test_cca_adjr2_r_baselines.py
 │   ├── test_dbrda.py
+│   ├── test_dbrda_r_baselines.py
+│   ├── test_dbrda_options_r_baselines.py
 │   ├── test_permutation.py
 │   ├── test_plotting.py
 │   └── test_public_api.py
@@ -569,7 +655,11 @@ rdacca_hp/
 ├── benchmark/
 │   ├── data/
 │   ├── expected/
-│   └── r_scripts/
+│   ├── r_scripts/
+│   ├── cca_r2_reference/
+│   ├── cca_adjr2_reference/
+│   ├── dbrda_reference/
+│   └── dbrda_options_reference/
 │
 ├── scripts/
 │   └── test_time.py

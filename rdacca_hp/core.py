@@ -5,9 +5,7 @@ from functools import lru_cache
 from typing import Union, List, Dict, Any, Tuple
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
-from sklearn.utils import resample
 from scipy.linalg import eigh
-from sklearn.manifold import MDS
 from sklearn.metrics import pairwise_distances
 from .utils import (
     check_data_quality,
@@ -17,7 +15,9 @@ from .utils import (
     generate_combination_names,
     get_combination_names,
     preprocess_predictor_dataframe,
+    preprocess_grouped_predictors,
     coerce_distance_input,
+    prepare_dbrda_response,
 )
 
 
@@ -191,163 +191,118 @@ def calculate_rda(dv: np.ndarray, iv: np.ndarray, type: str = "adjR2") -> float:
     return calculate_adjusted_r2(r_squared, n_samples, n_predictors)
 
 def chi_square_transform(Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Perform chi-square transformation for CCA
-
-    Parameters
-    ----------
-    Y : ndarray
-        Species abundance matrix (samples x species)
-
-    Returns
-    -------
-    tuple
-        (Y_chi, row_weights, col_weights) - Chi-square transformed matrix and weights
-    """
-    # Ensure non-negative values for species data
+    """Apply the same initial chi-square transformation as vegan::initCA."""
+    Y = _as_2d_float_array(Y)
+    if not np.all(np.isfinite(Y)):
+        raise ValueError("NA/NaN/Inf is not allowed in CCA response data")
     if np.any(Y < 0):
         raise ValueError("Species abundance data should be non-negative for CCA")
 
-    # Calculate totals
-    total = np.sum(Y)
-    row_totals = np.sum(Y, axis=1, keepdims=True)
-    col_totals = np.sum(Y, axis=0, keepdims=True)
+    row_totals = np.sum(Y, axis=1)
+    if np.any(row_totals <= 0):
+        raise ValueError("All row sums must be positive in the CCA response matrix")
 
-    # Calculate expected values under independence
-    expected = np.dot(row_totals, col_totals) / total
+    # vegan::cca excludes species columns that have zero marginal totals.
+    Y = Y[:, np.sum(Y, axis=0) > 0]
+    if Y.shape[1] == 0:
+        raise ValueError("CCA response data contain no positive species columns")
 
-    # Avoid division by zero
-    expected_safe = np.where(expected > 0, expected, 1)
-
-    # Chi-square transformation
-    Y_chi = (Y - expected) / np.sqrt(expected_safe)
-
-    # Calculate weights
-    row_weights = row_totals.flatten() / total
-    col_weights = col_totals.flatten() / total
-
+    proportions = Y / float(np.sum(Y))
+    row_weights = np.sum(proportions, axis=1)
+    col_weights = np.sum(proportions, axis=0)
+    expected = np.outer(row_weights, col_weights)
+    Y_chi = (proportions - expected) / np.sqrt(expected)
     return Y_chi, row_weights, col_weights
 
 
-def _permutation_cca_adjusted(Y: np.ndarray, X: np.ndarray, observed_r2: float,
-                              n_perm: int, row_weights: np.ndarray) -> float:
-    """
-    Calculate adjusted R-squared for CCA using permutation test
+def _cca_projection(Y_chi: np.ndarray, X: np.ndarray,
+                    row_weights: np.ndarray):
+    """Fit the weighted CCA constraint space used by vegan."""
+    X = _as_2d_float_array(X)
+    if X.shape[0] != Y_chi.shape[0]:
+        raise ValueError(
+            "Dependent and independent variables must have the same number of rows."
+        )
+    if not np.all(np.isfinite(X)):
+        raise ValueError("Independent variables contain NaN or Inf values.")
 
-    Parameters
-    ----------
-    Y : ndarray
-        Species data
-    X : ndarray
-        Environmental data
-    observed_r2 : float
-        Observed R-squared value
-    n_perm : int
-        Number of permutations
-    row_weights : ndarray
-        Row weights from chi-square transformation
+    weighted_mean = np.sum(X * row_weights[:, None], axis=0)
+    X_weighted = (X - weighted_mean) * np.sqrt(row_weights)[:, None]
 
-    Returns
-    -------
-    float
-        Adjusted R-squared
-    """
-    n_samples = Y.shape[0]
-    permuted_r2 = []
-
-    for i in range(n_perm):
-        # Permute species data while preserving site structure
-        perm_indices = resample(np.arange(n_samples), replace=False, n_samples=n_samples)
-        Y_perm = Y[perm_indices, :]
-
-        try:
-            # Recalculate R-squared with permuted data
-            Y_chi_perm, _, _ = chi_square_transform(Y_perm)
-            Y_weighted_perm = Y_chi_perm * np.sqrt(row_weights[:, np.newaxis])
-            X_weighted_perm = X * np.sqrt(row_weights[:, np.newaxis])
-
-            Y_centered_perm = Y_weighted_perm - np.mean(Y_weighted_perm, axis=0)
-            X_centered_perm = X_weighted_perm - np.mean(X_weighted_perm, axis=0)
-
-            covariance_perm = Y_centered_perm.T @ X_centered_perm
-            U_perm, s_perm, Vt_perm = np.linalg.svd(covariance_perm, full_matrices=False)
-
-            total_variance_perm = np.sum(Y_centered_perm ** 2)
-            explained_variance_perm = np.sum(s_perm ** 2)
-            r2_perm = safe_divide(explained_variance_perm, total_variance_perm)
-
-            permuted_r2.append(r2_perm)
-        except (np.linalg.LinAlgError, ValueError):
-            permuted_r2.append(0)
-
-    # Calculate adjusted R-squared using permutation distribution
-    if permuted_r2:
-        expected_r2 = np.mean(permuted_r2)
-        adj_r2 = observed_r2 - expected_r2
-        return max(0, adj_r2)  # Ensure non-negative
+    U, singular_values, _ = np.linalg.svd(X_weighted, full_matrices=False)
+    if singular_values.size == 0:
+        basis = np.empty((X.shape[0], 0), dtype=float)
     else:
-        return observed_r2
+        tolerance = 1e-7 * singular_values[0]
+        rank = int(np.sum(singular_values > tolerance))
+        basis = U[:, :rank]
+
+    fitted = basis @ (basis.T @ Y_chi)
+    total_inertia = float(np.sum(Y_chi ** 2))
+    if total_inertia <= 0:
+        raise ValueError("CCA response data have zero total inertia")
+    constrained_inertia = float(np.sum(fitted ** 2))
+    return constrained_inertia / total_inertia, basis, total_inertia
 
 
-def calculate_cca_r2_adj(Y: np.ndarray, X: np.ndarray, n_perm: int = 1000) -> Tuple[float, float]:
-    """
-    Calculate R-squared and adjusted R-squared for CCA using permutation
+def _permutation_cca_adjusted(Y_chi: np.ndarray, X: np.ndarray,
+                              row_weights: np.ndarray, basis: np.ndarray,
+                              observed_r2: float, n_perm: int,
+                              random_state=None) -> float:
+    """Apply vegan::RsquareAdj.cca's permutation adjustment."""
+    n_perm = int(n_perm)
+    if n_perm < 1:
+        raise ValueError("n_perm must be at least 1 for CCA adjusted R2")
+    if basis.shape[1] == 0:
+        raise ValueError("CCA adjusted R2 is undefined for a rank-zero model")
+    if basis.shape[1] >= Y_chi.shape[0] - 1:
+        raise ValueError("CCA adjusted R2 is undefined without residual degrees of freedom")
 
-    Parameters
-    ----------
-    Y : ndarray
-        Species abundance matrix
-    X : ndarray
-        Environmental variables matrix
-    n_perm : int
-        Number of permutations for adjusted R-squared calculation
+    rng = (
+        random_state
+        if isinstance(random_state, np.random.Generator)
+        else np.random.default_rng(random_state)
+    )
+    permuted_r2 = np.empty(n_perm, dtype=float)
+    for i in range(n_perm):
+        permutation = rng.permutation(Y_chi.shape[0])
+        permuted = Y_chi[permutation, :]
+        permuted_weights = row_weights[permutation]
 
-    Returns
-    -------
-    tuple
-        (r_squared, adj_r_squared)
-    """
-    n_samples, n_species = Y.shape
-    n_predictors = X.shape[1]
+        # vegan::permutest.cca permutes the CCA row weights with the
+        # response and rebuilds the weighted constraint QR for every
+        # permutation. A fixed observed-model basis overestimates adjR2.
+        permuted_r2[i], _, _ = _cca_projection(
+            permuted,
+            X,
+            permuted_weights,
+        )
 
-    # Chi-square transformation
+    mean_permuted_r2 = float(np.mean(permuted_r2))
+    denominator = 1.0 - mean_permuted_r2
+    if abs(denominator) < 1e-12:
+        raise ValueError("CCA adjusted R2 is undefined for this permutation distribution")
+    return 1.0 - (1.0 - observed_r2) / denominator
+
+
+def calculate_cca_r2_adj(Y: np.ndarray, X: np.ndarray, n_perm: int = 1000,
+                         random_state=None) -> Tuple[float, float]:
     Y_chi, row_weights, _ = chi_square_transform(Y)
-
-    # Weighted correlation/covariance calculation
-    Y_weighted = Y_chi * np.sqrt(row_weights[:, np.newaxis])
-    X_weighted = X * np.sqrt(row_weights[:, np.newaxis])
-
-    # Calculate R-squared using SVD
-    try:
-        # Center the weighted matrices
-        Y_centered = Y_weighted - np.mean(Y_weighted, axis=0)
-        X_centered = X_weighted - np.mean(X_weighted, axis=0)
-
-        # SVD approach for CCA
-        covariance = Y_centered.T @ X_centered
-        U, s, Vt = np.linalg.svd(covariance, full_matrices=False)
-
-        # R-squared as proportion of variance explained
-        total_variance = np.sum(Y_centered ** 2)
-        explained_variance = np.sum(s ** 2)
-        r_squared = safe_divide(explained_variance, total_variance)
-
-    except (np.linalg.LinAlgError, ValueError):
-        # Fallback to simple correlation if SVD fails
-        correlation_matrix = np.corrcoef(np.column_stack([Y_weighted, X_weighted]).T)
-        if correlation_matrix.shape[0] > 1:
-            cross_corr = correlation_matrix[:n_species, n_species:]
-            r_squared = np.mean(cross_corr ** 2) if cross_corr.size > 0 else 0
-        else:
-            r_squared = 0
-
-    # Permutation test for adjusted R-squared
-    adj_r_squared = _permutation_cca_adjusted(Y, X, r_squared, n_perm, row_weights)
-
+    r_squared, basis, total_inertia = _cca_projection(Y_chi, X, row_weights)
+    adj_r_squared = _permutation_cca_adjusted(
+        Y_chi,
+        X,
+        row_weights,
+        basis,
+        r_squared,
+        n_perm,
+        random_state=random_state,
+    )
     return r_squared, adj_r_squared
 
 
-def calculate_cca(dv: np.ndarray, iv: np.ndarray, type: str = "adjR2", n_perm: int = 1000) -> float:
+def calculate_cca(dv: np.ndarray, iv: np.ndarray, type: str = "adjR2",
+                  n_perm: int = 1000, random_state=None) -> float:
     """
     Calculate R-squared for CCA (Canonical Correspondence Analysis)
 
@@ -367,22 +322,23 @@ def calculate_cca(dv: np.ndarray, iv: np.ndarray, type: str = "adjR2", n_perm: i
     float
         R-squared value
     """
-    # Check if species data is appropriate for CCA
-    if np.any(dv < 0):
-        print("Warning: Negative values in species data. CCA typically requires non-negative abundance data.")
+    if type not in {"R2", "adjR2"}:
+        raise ValueError("type must be 'R2' or 'adjR2'")
 
-    try:
-        r_squared, adj_r_squared = calculate_cca_r2_adj(dv, iv, n_perm)
+    Y_chi, row_weights, _ = chi_square_transform(dv)
+    r_squared, basis, total_inertia = _cca_projection(Y_chi, iv, row_weights)
+    if type == "R2":
+        return r_squared
 
-        if type == "R2":
-            return r_squared
-        else:
-            return adj_r_squared
-
-    except Exception as e:
-        print(f"CCA calculation failed: {e}. Falling back to RDA calculation.")
-        # Fallback to RDA if CCA fails
-        return calculate_rda(dv, iv, type)
+    return _permutation_cca_adjusted(
+        Y_chi,
+        iv,
+        row_weights,
+        basis,
+        r_squared,
+        n_perm,
+        random_state=random_state,
+    )
 
 
 def calculate_pcoa(distance_matrix: np.ndarray, n_axes: int = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -487,36 +443,26 @@ def euclidify_distance_matrix(distance_matrix: np.ndarray, method: str = "lingoe
             return np.sqrt(new_D_sq)
 
     elif method == "cailliez":
-        # Cailliez method: add constant to all elements
+        # Match vegan::addCailliez: use the largest real eigenvalue of
+        # the 2n x 2n block matrix built from Gower-centred distances.
         n = distance_matrix.shape[0]
 
-        # Create matrices for the Cailliez method
-        A = -0.5 * distance_matrix ** 2
-        I = np.eye(n)
-        ones = np.ones((n, n))
+        def gower_double_center(matrix):
+            return (
+                matrix
+                - np.mean(matrix, axis=0, keepdims=True)
+                - np.mean(matrix, axis=1, keepdims=True)
+                + np.mean(matrix)
+            )
 
-        # Construct the matrix for the eigenvalue problem
-        M = np.block([
-            [A @ (I - ones / n), -I],
-            [-(I - ones / n) @ A @ (I - ones / n), (I - ones / n) @ A]
-        ])
+        z = np.zeros((2 * n, 2 * n), dtype=float)
+        z[n:, :n] = -np.eye(n)
+        z[:n, n:] = -gower_double_center(distance_matrix ** 2)
+        z[n:, n:] = gower_double_center(2.0 * distance_matrix)
 
-        # Find eigenvalues
-        eigenvalues = np.linalg.eigvals(M)
-        real_eigenvalues = eigenvalues[np.isreal(eigenvalues)].real
-
-        if len(real_eigenvalues) == 0:
-            # Fallback to Lingoes method
-            return euclidify_distance_matrix(distance_matrix, method="lingoes")
-
-        constant = np.max(real_eigenvalues)
-
-        if constant <= 0:
-            # Already Euclidean
-            return distance_matrix
-        else:
-            # Add constant
-            return distance_matrix + constant * (1 - np.eye(n))
+        eigenvalues = np.linalg.eigvals(z)
+        constant = max(float(np.max(eigenvalues.real)), 0.0)
+        return distance_matrix + constant * (1 - np.eye(n))
 
     else:
         raise ValueError("Method must be 'lingoes' or 'cailliez'")
@@ -570,47 +516,21 @@ def calculate_rda_r2_adj(dv: np.ndarray, iv: np.ndarray, type: str = "adjR2") ->
     adj_r_squared = calculate_adjusted_r2(r_squared, n_samples, n_predictors)
     return r_squared, adj_r_squared
 
-def _calculate_dbrda_fallback(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2") -> float:
-    """
-    Fallback method for db-RDA when PCoA fails
+def _apply_distance_correction(distance_matrix: np.ndarray, add=False) -> np.ndarray:
+    """Apply vegan-compatible ``add`` choices to a dissimilarity matrix."""
+    if add is False or add is None:
+        return distance_matrix
+    if add is True:
+        method = "lingoes"
+    elif isinstance(add, str) and add.lower() in {"lingoes", "cailliez"}:
+        method = add.lower()
+    else:
+        raise ValueError("add must be False, True, 'lingoes', or 'cailliez'")
+    return euclidify_distance_matrix(distance_matrix, method=method)
 
-    Parameters
-    ----------
-    dv_dist : ndarray
-        Distance matrix
-    iv : ndarray
-        Environmental variables
-    type : str
-
-    Returns
-    -------
-    float
-        R-squared value
-    """
-    # Simple approach: use distance matrix directly with some transformation
-    n_samples = dv_dist.shape[0]
-
-    # Try to convert distance matrix to Euclidean space using simple method
-    try:
-        # Use classical multidimensional scaling
-        mds = MDS(n_components=min(10, n_samples - 1), dissimilarity='precomputed', random_state=42)
-        mds_scores = mds.fit_transform(dv_dist)
-
-        # Use MDS scores as response variables
-        r_squared, adj_r_squared = calculate_rda_r2_adj(mds_scores, iv, type)
-
-        if type == "R2":
-            return r_squared
-        else:
-            return adj_r_squared
-
-    except Exception as e:
-        print(f"db-RDA fallback also failed: {e}")
-        # Last resort: return a reasonable default
-        return 0.0
 
 def _calculate_dbrda_vegan_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2",
-                                 add: bool = False, sqrt_dist: bool = False) -> float:
+                                 add=False, sqrt_dist: bool = False) -> float:
     """
     Vegan::dbrda-style db-RDA R2/adjusted R2.
 
@@ -627,8 +547,7 @@ def _calculate_dbrda_vegan_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str 
     if sqrt_dist:
         distance_matrix = np.sqrt(distance_matrix)
 
-    if add:
-        distance_matrix = euclidify_distance_matrix(distance_matrix, method="lingoes")
+    distance_matrix = _apply_distance_correction(distance_matrix, add=add)
 
     n_samples = distance_matrix.shape[0]
 
@@ -667,7 +586,7 @@ def _calculate_dbrda_vegan_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str 
 
 
 def calculate_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2",
-                    add: bool = False, sqrt_dist: bool = False, n_axes: int = None,
+                    add=False, sqrt_dist: bool = False, n_axes: int = None,
                     dbrdatype: str = "dbrda") -> float:
     """
     Calculate R-squared for db-RDA.
@@ -713,25 +632,18 @@ def calculate_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2",
     if sqrt_dist:
         distance_matrix = np.sqrt(distance_matrix)
 
-    if add:
-        distance_matrix = euclidify_distance_matrix(distance_matrix, method="lingoes")
+    distance_matrix = _apply_distance_correction(distance_matrix, add=add)
 
-    try:
-        pcoa_scores, eigenvalues = calculate_pcoa(distance_matrix, n_axes)
+    pcoa_scores, eigenvalues = calculate_pcoa(distance_matrix, n_axes)
 
-        if pcoa_scores.shape[1] == 0:
-            raise ValueError("PCoA produced no positive eigenvalues")
+    if pcoa_scores.shape[1] == 0:
+        raise ValueError("PCoA produced no positive eigenvalues")
 
-        r_squared, adj_r_squared = calculate_rda_r2_adj(pcoa_scores, iv, type)
+    r_squared, adj_r_squared = calculate_rda_r2_adj(pcoa_scores, iv, type)
 
-        if type == "R2":
-            return r_squared
-        else:
-            return adj_r_squared
-
-    except Exception as e:
-        print(f"db-RDA calculation failed: {e}")
-        return _calculate_dbrda_fallback(distance_matrix, iv, type)
+    if type == "R2":
+        return r_squared
+    return adj_r_squared
 
 def _prepare_multi_group_iv(iv: Union[List, Dict]) -> Tuple[List[np.ndarray], List[str]]:
     """
@@ -756,7 +668,7 @@ def _prepare_multi_group_iv(iv: Union[List, Dict]) -> Tuple[List[np.ndarray], Li
                 group_data = group_data.values
             iv_arrays.append(group_data)
     elif isinstance(iv, list):
-        group_names = [f"Group_{i + 1}" for i in range(len(iv))]
+        group_names = [f"X{i + 1}" for i in range(len(iv))]
         iv_arrays = []
         for i, group_data in enumerate(iv):
             if hasattr(group_data, 'values'):
@@ -804,6 +716,9 @@ def _rdacca_hp_multi(dv, iv, method, type, scale, var_part, **kwargs):
     iv_arrays, group_names = _prepare_multi_group_iv(iv)
     n_groups = len(iv_arrays)
 
+    if n_groups < 2:
+        raise ValueError("Analysis not conducted. Insufficient number of predictor groups.")
+
     # Check data quality for each group
     for i, group_data in enumerate(iv_arrays):
         _, group_clean = check_data_quality(dv, group_data)
@@ -831,7 +746,13 @@ def _rdacca_hp_multi(dv, iv, method, type, scale, var_part, **kwargs):
             r2_value = calculate_rda(dv, combined_iv, type)
             commonM[i, 1] = r2_value
         elif method.upper() in ["CCA"]:
-            r2_value = calculate_cca(dv, combined_iv, type, n_perm=kwargs.get('n_perm', 1000))
+            r2_value = calculate_cca(
+                dv,
+                combined_iv,
+                type,
+                n_perm=kwargs.get('n_perm', 1000),
+                random_state=kwargs.get('_cca_rng'),
+            )
             commonM[i, 1] = r2_value
         elif method.upper() in ["DBRDA"]:
             r2_value = calculate_dbrda(
@@ -896,7 +817,7 @@ def _rdacca_hp_multi(dv, iv, method, type, scale, var_part, **kwargs):
     # Calculate percentages
     total_individual = round(np.sum(VariableImportance[:, 2]), 3)
 
-    if total_individual <= 0:
+    if total_individual == 0:
         VariableImportance[:, 3] = 0.0
     else:
         percentages = 100 * VariableImportance[:, 2] / total_individual
@@ -1017,7 +938,13 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
             r2_value = calculate_rda(dv, subset_iv, type)
             commonM[i, 1] = r2_value
         elif method.upper() in ["CCA"]:
-            r2_value = calculate_cca(dv, subset_iv, type, n_perm=kwargs.get('n_perm', 1000))
+            r2_value = calculate_cca(
+                dv,
+                subset_iv,
+                type,
+                n_perm=kwargs.get('n_perm', 1000),
+                random_state=kwargs.get('_cca_rng'),
+            )
             commonM[i, 1] = r2_value
         elif method.upper() in ["DBRDA"]:
             r2_value = calculate_dbrda(
@@ -1077,7 +1004,7 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
     # Percentages
     total_individual = round(np.sum(VariableImportance[:, 2]), 3)
 
-    if total_individual <= 0:
+    if total_individual == 0:
         VariableImportance[:, 3] = 0.0
     else:
         percentages = 100 * VariableImportance[:, 2] / total_individual
@@ -1118,12 +1045,14 @@ def rdacca_hp(dv: Union[np.ndarray, pd.DataFrame],
               scale: bool = False,
               var_part: bool = False,
               n_perm: int = 1000,  # For CCA
-              add: bool = False,  # For db-RDA
+              add: bool | str = False,  # False, True/"lingoes", or "cailliez"
               sqrt_dist: bool = False,  # For db-RDA
               n_axes: int = None,  # For db-RDA
               dbrdatype: str = "dbrda",  # For db-RDA: "dbrda" or "capscale"
               ordered_factors: dict | None = None,
               categorical_factors: list | None = None,
+              distance: str | None = None,  # For raw db-RDA response matrices
+              random_state: int | None = None,  # For reproducible CCA adjusted R2
               **kwargs) -> RdaccaHpResult:
     """
     Hierarchical and Variation Partitioning for Canonical Analysis
@@ -1144,12 +1073,18 @@ def rdacca_hp(dv: Union[np.ndarray, pd.DataFrame],
         Whether to show variation partitioning results
     n_perm : int
         Number of permutations for computing adjusted R-square for CCA
-    add : bool
-        Whether to add constant to make distance matrix Euclidean (for db-RDA)
+    random_state : int, optional
+        Seed for reproducible CCA adjusted R-square permutations.
+    add : bool or str
+        Euclidification correction for db-RDA: False, True/"lingoes", or
+        "cailliez".
     sqrt_dist : bool
         Whether to take square root of distances (for db-RDA)
     n_axes : int, optional
         Number of PCoA axes to use (for db-RDA)
+    distance : str, optional
+        Distance method used when db-RDA receives a raw response matrix. If
+        None, dv must already be a square distance matrix or condensed vector.
 
     Returns
     -------
@@ -1167,25 +1102,32 @@ def rdacca_hp(dv: Union[np.ndarray, pd.DataFrame],
     if type not in ["R2", "adjR2"]:
         raise ValueError("type must be 'R2' or 'adjR2'")
 
-    # Special check for db-RDA
+    # Existing calls with precomputed distances remain unchanged when
+    # distance=None. A named method means dv is raw response data.
     if method == "DBRDA":
-        dv = coerce_distance_input(dv)
-        
+        dv = prepare_dbrda_response(dv, distance=distance)
+
+    # These parameters apply to both the data.frame-style and grouped paths.
+    kwargs['n_perm'] = n_perm
+    kwargs['add'] = add
+    kwargs['sqrt_dist'] = sqrt_dist
+    kwargs['n_axes'] = n_axes
+    kwargs['dbrdatype'] = dbrdatype
+    kwargs['ordered_factors'] = ordered_factors
+    kwargs['categorical_factors'] = categorical_factors
+    if method == "CCA" and type == "adjR2":
+        kwargs['_cca_rng'] = np.random.default_rng(random_state)
+
     # Handle different types of iv input
     if isinstance(iv, (list, dict)):
-        # Multiple predictor groups
-        kwargs['ordered_factors'] = ordered_factors
-        kwargs['categorical_factors'] = categorical_factors
+        # Match the R list-of-data.frames branch: each element is one logical
+        # predictor group, including any encoded factor columns it contains.
+        iv = preprocess_grouped_predictors(
+            iv,
+            ordered_factors=ordered_factors,
+            categorical_factors=categorical_factors,
+            warn=False,
+        )
         return _rdacca_hp_multi(dv, iv, method, type, scale, var_part, **kwargs)
-    else:
-        # Single predictor group
-        # Pass additional parameters to the single group function
-        kwargs['n_perm'] = n_perm
-        kwargs['add'] = add
-        kwargs['sqrt_dist'] = sqrt_dist
-        kwargs['n_axes'] = n_axes
-        kwargs['dbrdatype'] = dbrdatype
-        kwargs['ordered_factors'] = ordered_factors
-        kwargs['categorical_factors'] = categorical_factors
 
-        return _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs)
+    return _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs)

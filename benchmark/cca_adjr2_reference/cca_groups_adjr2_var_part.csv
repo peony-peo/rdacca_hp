@@ -1,0 +1,9 @@
+"","Fractions","  % Total"
+"Unique to Environment                   ",0.1627,40.55
+"Unique to Spatial                       ",0.0282,7.03
+"Unique to PCNM                          ",0.0204,5.09
+"Common to Environment, and Spatial      ",0.013,3.23
+"Common to Environment, and PCNM         ",0.0521,12.99
+"Common to Spatial, and PCNM             ",0.0136,3.4
+"Common to Environment, Spatial, and PCNM",0.1113,27.72
+"Total                                   ",0.4013,100

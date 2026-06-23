@@ -1,0 +1,33 @@
+"","Fractions","  % Total"
+"Unique to SubsDens                                      ",0.0298,8.77
+"Unique to WatrCont                                      ",0.0873,25.7
+"Unique to Substrate                                     ",0.0435,12.81
+"Unique to Shrub                                         ",0.0164,4.83
+"Unique to Topo                                          ",0.0248,7.31
+"Common to SubsDens, and WatrCont                        ",0.012,3.53
+"Common to SubsDens, and Substrate                       ",0.0033,0.97
+"Common to WatrCont, and Substrate                       ",-0.0069,-2.03
+"Common to SubsDens, and Shrub                           ",0.0083,2.44
+"Common to WatrCont, and Shrub                           ",0.0649,19.12
+"Common to Substrate, and Shrub                          ",-0.002,-0.6
+"Common to SubsDens, and Topo                            ",-0.005,-1.47
+"Common to WatrCont, and Topo                            ",0.0076,2.23
+"Common to Substrate, and Topo                           ",0.0065,1.91
+"Common to Shrub, and Topo                               ",0.0015,0.44
+"Common to SubsDens, WatrCont, and Substrate             ",0.0024,0.71
+"Common to SubsDens, WatrCont, and Shrub                 ",-0.0143,-4.21
+"Common to SubsDens, Substrate, and Shrub                ",-0.0028,-0.82
+"Common to WatrCont, Substrate, and Shrub                ",0.0166,4.9
+"Common to SubsDens, WatrCont, and Topo                  ",-0.0051,-1.51
+"Common to SubsDens, Substrate, and Topo                 ",-0.005,-1.46
+"Common to WatrCont, Substrate, and Topo                 ",-0.0083,-2.44
+"Common to SubsDens, Shrub, and Topo                     ",0.0028,0.83
+"Common to WatrCont, Shrub, and Topo                     ",0.0685,20.17
+"Common to Substrate, Shrub, and Topo                    ",-3e-04,-0.09
+"Common to SubsDens, WatrCont, Substrate, and Shrub      ",0.0012,0.35
+"Common to SubsDens, WatrCont, Substrate, and Topo       ",0.0067,1.96
+"Common to SubsDens, WatrCont, Shrub, and Topo           ",0.0083,2.44
+"Common to SubsDens, Substrate, Shrub, and Topo          ",0.0017,0.5
+"Common to WatrCont, Substrate, Shrub, and Topo          ",-0.0193,-5.68
+"Common to SubsDens, WatrCont, Substrate, Shrub, and Topo",-0.0055,-1.62
+"Total                                                   ",0.3396,100

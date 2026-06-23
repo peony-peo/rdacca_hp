@@ -1,0 +1,19 @@
+$permutations_9
+$permutations_9$r.squared
+[1] 0.2028812
+
+$permutations_9$adj.r.squared
+[1] 0.1672273
+
+
+$permutations_9999
+$permutations_9999$r.squared
+[1] 0.2028812
+
+$permutations_9999$adj.r.squared
+[1] 0.1672273
+
+
+$identical_results
+[1] TRUE
+

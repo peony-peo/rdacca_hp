@@ -4,11 +4,17 @@ from typing import Union, List, Dict
 import time
 
 from .core import rdacca_hp, _rdacca_hp_multi, _rdacca_hp_single
-from .utils import sanitize_tabular_input, preprocess_predictor_dataframe, coerce_distance_input
+from .utils import (
+    sanitize_tabular_input,
+    preprocess_predictor_dataframe,
+    preprocess_grouped_predictors,
+    prepare_dbrda_response,
+)
 
 
-def _build_permutation_engine(iv, method, type, scale, n_perm, add, sqrt_dist, n_axes,
-                              ordered_factors, categorical_factors, kwargs):
+def _build_permutation_engine(iv, method, type, scale, n_perm, add, sqrt_dist, n_axes, dbrdatype,
+                              ordered_factors, categorical_factors, kwargs,
+                              cca_rng=None):
     """
     Build a lightweight evaluator for permutation runs without changing the public API
     or output structure.
@@ -18,8 +24,13 @@ def _build_permutation_engine(iv, method, type, scale, n_perm, add, sqrt_dist, n
     core_kwargs["add"] = add
     core_kwargs["sqrt_dist"] = sqrt_dist
     core_kwargs["n_axes"] = n_axes
+    core_kwargs["dbrdatype"] = dbrdatype
     core_kwargs["ordered_factors"] = ordered_factors
     core_kwargs["categorical_factors"] = categorical_factors
+    if method == "CCA" and type == "adjR2":
+        core_kwargs["_cca_rng"] = (
+            cca_rng if cca_rng is not None else np.random.default_rng()
+        )
 
     # Single DataFrame input in rdacca_hp() is internally converted into logical
     # predictor groups (including categorical / ordered factor expansions).
@@ -46,6 +57,13 @@ def _build_permutation_engine(iv, method, type, scale, n_perm, add, sqrt_dist, n
         return encoded_groups, evaluate
 
     if isinstance(iv, (dict, list)):
+        grouped_iv = preprocess_grouped_predictors(
+            iv,
+            ordered_factors=ordered_factors,
+            categorical_factors=categorical_factors,
+            warn=False,
+        )
+
         def evaluate(dv_current, iv_current):
             return _rdacca_hp_multi(
                 dv=dv_current,
@@ -57,7 +75,7 @@ def _build_permutation_engine(iv, method, type, scale, n_perm, add, sqrt_dist, n
                 **core_kwargs,
             )
 
-        return iv, evaluate
+        return grouped_iv, evaluate
 
     def evaluate(dv_current, iv_current):
         return _rdacca_hp_single(
@@ -80,13 +98,16 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
              permutations: int = 1000,
              scale: bool = False,
              n_perm: int = 1000,          # for CCA adjR2
-             add: bool = False,           # for dbRDA
+             add: bool | str = False,     # False, True/"lingoes", or "cailliez"
              sqrt_dist: bool = False,     # for dbRDA
              n_axes: int = None,          # for dbRDA
              ordered_factors: dict | None = None,
              categorical_factors: list | None = None,
              verbose: bool = True,
              random_state: int | None = None,
+             dbrdatype: str = "dbrda",
+             distance: str | None = None,
+             skip_failed: bool = False,
              **kwargs) -> pd.DataFrame:
     """
     Permutation test for hierarchical partitioning.
@@ -97,6 +118,13 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
       are performed.
     - For DataFrame input, each original predictor is permuted independently.
     - For dict/list grouped input, all groups are permuted using the same row order.
+    - Supplying ``distance`` treats ``dv`` as raw response data and computes the
+      db-RDA distance matrix once before the permutation loop.
+    - The result matches R ``permu.hp()`` with ``Individual`` and ``Pr(>I)``
+      columns. Significance stars are included in the character ``Pr(>I)``
+      values using the same spacing rules as R.
+    - By default a failed permutation stops the analysis, as in R. Set
+      ``skip_failed=True`` to omit failed permutations.
     """
 
     method = method.upper()
@@ -113,18 +141,19 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
     ordered_factors = ordered_factors or {}
     categorical_factors = categorical_factors or []
     rng = np.random.default_rng(random_state)
+    cca_rng = rng if method == "CCA" and type == "adjR2" else None
 
     dv = sanitize_tabular_input(dv, warn=verbose)
     iv = sanitize_tabular_input(iv, warn=verbose)
     iv_is_dataframe_input = isinstance(iv, pd.DataFrame)
 
-    # Internal optimized evaluators (_rdacca_hp_multi/_rdacca_hp_single) do not
-    # run the public rdacca_hp() dbRDA input coercion step.  Therefore, when dbRDA
-    # receives an R-like condensed distance vector, convert it once here to a
-    # square distance matrix for all permutation runs.  This keeps the optimized
-    # loop while preventing a condensed vector of length n*(n-1)/2 from being
-    # mistaken for n samples inside lower-level checks.
-    dv_for_permutation = coerce_distance_input(dv) if method == "DBRDA" else dv
+    # Prepare distances only once. Recomputing them in every randomized run
+    # would be unnecessary because permu.hp permutes iv, not dv.
+    dv_for_permutation = (
+        prepare_dbrda_response(dv, distance=distance)
+        if method == "DBRDA"
+        else dv
+    )
 
     n_random = permutations - 1
 
@@ -134,7 +163,7 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
 
     # ---- observed result ----
     obs_result = rdacca_hp(
-        dv=dv,
+        dv=dv_for_permutation,
         iv=iv,
         method=method,
         type=type,
@@ -144,8 +173,11 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
         add=add,
         sqrt_dist=sqrt_dist,
         n_axes=n_axes,
+        dbrdatype=dbrdatype,
+        distance=None,
         ordered_factors=ordered_factors,
         categorical_factors=categorical_factors,
+        random_state=cca_rng,
         **kwargs
     )
 
@@ -162,9 +194,11 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
         add=add,
         sqrt_dist=sqrt_dist,
         n_axes=n_axes,
+        dbrdatype=dbrdatype,
         ordered_factors=ordered_factors,
         categorical_factors=categorical_factors,
         kwargs=kwargs,
+        cca_rng=cca_rng,
     )
 
     # ---- initialize ----
@@ -190,6 +224,8 @@ def permu_hp(dv: Union[np.ndarray, pd.DataFrame],
             perm_individual[i, :] = perm_result.hier_part["Individual"].to_numpy(dtype=float)
 
         except Exception as e:
+            if not skip_failed:
+                raise
             failed_perms += 1
             if verbose:
                 print(f"Warning: permutation {i + 1} failed: {e}")
@@ -388,19 +424,39 @@ def _calculate_p_values(obs_values: np.ndarray,
         x = np.concatenate(([obs_values[i]], perm_values[:, i]))
         ecdf_at_obs = np.mean(x <= obs_values[i])
         p = 1.0 - ecdf_at_obs + 1.0 / (total_permutations + 1.0)
-        p_values[i] = round(float(p), decimals)
+        # R's round() uses IEC 60559 ties-to-even rounding. NumPy follows
+        # that rule, while Python's built-in round can differ for decimal
+        # halfway values because of their binary representation.
+        p_values[i] = float(np.round(p, decimals))
 
     return p_values
 
 
 def _create_result_dataframe(obs_result, p_values: np.ndarray) -> pd.DataFrame:
     """
-    Merge observed hierarchical partitioning result with p-values.
+    Format permutation results like R permu.hp or as the expanded Python table.
     """
-    hier_part = obs_result.hier_part.copy()
-    hier_part["Pr(>I)"] = p_values
-    hier_part["Significance"] = hier_part["Pr(>I)"].apply(_format_significance)
-    return hier_part
+    hier_part = obs_result.hier_part
+    return pd.DataFrame(
+        {
+            "Individual": hier_part["Individual"].to_numpy(dtype=float),
+            "Pr(>I)": [_format_r_p_value(value) for value in p_values],
+        },
+        index=hier_part.index,
+    )
+
+
+def _format_r_p_value(p_value: float) -> str:
+    """Combine the rounded p-value and stars as R permu.hp prints them."""
+    if p_value <= 0.001:
+        suffix = " ***"
+    elif p_value <= 0.01:
+        suffix = "  **"
+    elif p_value <= 0.05:
+        suffix = "   *"
+    else:
+        suffix = "    "
+    return f"{p_value:g}{suffix}"
 
 
 def _format_significance(p_value: float) -> str:
