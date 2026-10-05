@@ -234,3 +234,95 @@ capture.output(
   sessionInfo(),
   file = file.path(out, "R_session_info.txt")
 )
+
+
+####################################################
+library(vegan)
+library(rdacca.hp)
+
+data(mite)
+data(mite.env)
+data(mite.xy)
+data(mite.pcnm)
+
+output_dir <- file.path(getwd(), "cca_adjr2_reference")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+write_result <- function(result, prefix) {
+  write.csv(
+    result$Hier.part,
+    file.path(output_dir, paste0(prefix, "_hier_part.csv"))
+  )
+  write.csv(
+    result$Var.part,
+    file.path(output_dir, paste0(prefix, "_var_part.csv"))
+  )
+  write.csv(
+    data.frame(total = result$Total_explained_variation),
+    file.path(output_dir, paste0(prefix, "_total.csv")),
+    row.names = FALSE
+  )
+}
+
+# rdacca.hp 1.1-3 passes n.perm to cca(), not to RsquareAdj().
+# Therefore these references use the effective R default of 1000 permutations.
+set.seed(202601)
+cca_xy <- rdacca.hp(
+  mite,
+  mite.xy,
+  method = "CCA",
+  type = "adjR2",
+  var.part = TRUE
+)
+write_result(cca_xy, "cca_xy_adjr2")
+
+set.seed(202602)
+cca_env <- rdacca.hp(
+  mite,
+  mite.env,
+  method = "CCA",
+  type = "adjR2",
+  var.part = TRUE
+)
+write_result(cca_env, "cca_env_adjr2")
+
+groups <- list(
+  Environment = mite.env,
+  Spatial = mite.xy,
+  PCNM = mite.pcnm[, 1:3, drop = FALSE]
+)
+
+set.seed(202603)
+cca_groups <- rdacca.hp(
+  mite,
+  groups,
+  method = "CCA",
+  type = "adjR2",
+  var.part = TRUE
+)
+write_result(cca_groups, "cca_groups_adjr2")
+
+# Confirm whether n.perm supplied to cca() changes RsquareAdj.cca().
+set.seed(202604)
+fit_9 <- cca(mite ~ ., data = mite.xy, permutations = 9)
+adj_9 <- RsquareAdj(fit_9)
+
+set.seed(202604)
+fit_9999 <- cca(mite ~ ., data = mite.xy, permutations = 9999)
+adj_9999 <- RsquareAdj(fit_9999)
+
+capture.output(
+  list(
+    permutations_9 = adj_9,
+    permutations_9999 = adj_9999,
+    identical_results = identical(adj_9, adj_9999)
+  ),
+  file = file.path(output_dir, "n_perm_effect_check.txt")
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(output_dir, "R_session_info.txt")
+)
+
+message("Files written to: ", normalizePath(output_dir))

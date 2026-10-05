@@ -87,6 +87,11 @@ def test_permu_hp_returns_expected_columns_for_rda():
 
 
 def test_permu_hp_stops_on_failed_permutation_by_default(monkeypatch):
+    """
+    RDA now uses the dedicated batched fast permutation path, so test the
+    public failure behavior at that path instead of monkeypatching the legacy
+    per-permutation evaluator that RDA no longer calls.
+    """
     dv, iv = create_test_data(
         n_samples=20,
         n_predictors=2,
@@ -95,16 +100,13 @@ def test_permu_hp_stops_on_failed_permutation_by_default(monkeypatch):
     )
     iv_df = pd.DataFrame(iv, columns=["A", "B"])
 
-    def fake_build_permutation_engine(**kwargs):
-        def fail(_dv, _iv):
-            raise ValueError("forced permutation failure")
-
-        return kwargs["iv"], fail
+    def fail_batched_rda(**kwargs):
+        raise ValueError("forced permutation failure")
 
     monkeypatch.setattr(
         permutation_module,
-        "_build_permutation_engine",
-        fake_build_permutation_engine,
+        "_rda_permutation_individuals_batched",
+        fail_batched_rda,
     )
 
     with pytest.raises(ValueError, match="forced permutation failure"):

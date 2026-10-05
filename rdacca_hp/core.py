@@ -190,6 +190,150 @@ def calculate_rda(dv: np.ndarray, iv: np.ndarray, type: str = "adjR2") -> float:
         return r_squared
     return calculate_adjusted_r2(r_squared, n_samples, n_predictors)
 
+
+
+def _rda_subset_r2_values_fast(dv: np.ndarray, group_arrays, combo_indices, type: str) -> np.ndarray:
+    """Compute RDA R2/adjR2 for every logical predictor subset from shared cross-products.
+
+    This is algebraically equivalent to fitting OLS with an intercept for each subset,
+    but avoids rebuilding and refitting the full n x k least-squares problem thousands
+    of times.  One centered cross-product system is reused for all subsets.
+
+    ``group_arrays`` is a list of 2D arrays.  For ordinary numeric data-frame input
+    each group contains one original predictor; for grouped/factor input one logical
+    group may contain multiple encoded columns.
+    """
+    Y = _as_2d_float_array(dv)
+    groups = []
+    for group in group_arrays:
+        arr = _as_2d_float_array(group)
+        if arr.shape[0] != Y.shape[0]:
+            raise ValueError("Dependent and independent variables must have the same number of rows.")
+        groups.append(arr)
+
+    if not groups:
+        return np.empty(0, dtype=float)
+
+    n_samples = Y.shape[0]
+    widths = [g.shape[1] for g in groups]
+    starts = np.cumsum([0] + widths)
+    X = np.hstack(groups)
+
+    # OLS with an intercept is equivalent to least squares on centered X and Y.
+    Xc = X - np.mean(X, axis=0, keepdims=True)
+    Yc = Y - np.mean(Y, axis=0, keepdims=True)
+    total_ss = float(np.sum(Yc * Yc))
+
+    n_total_cols = Xc.shape[1]
+    # If the full design is rank-deficient / extremely ill-conditioned, keep the
+    # numerically safer direct-lstsq route for subsets.  In ordinary well-conditioned
+    # ecological predictor tables the much faster Gram route is used.
+    full_rank = np.linalg.matrix_rank(Xc) == n_total_cols
+    use_gram = bool(full_rank)
+    if use_gram and n_total_cols > 1:
+        try:
+            use_gram = np.linalg.cond(Xc) < 1e8
+        except np.linalg.LinAlgError:
+            use_gram = False
+
+    if use_gram:
+        gram = Xc.T @ Xc
+        cross = Xc.T @ Yc
+    else:
+        gram = cross = None
+
+    out = np.empty(len(combo_indices), dtype=float)
+    for i, selected_groups in enumerate(combo_indices):
+        cols = []
+        for g in selected_groups:
+            cols.extend(range(int(starts[g]), int(starts[g + 1])))
+        cols = np.asarray(cols, dtype=np.intp)
+        k = int(cols.size)
+
+        if total_ss <= 0.0:
+            r_squared = 1.0
+        elif use_gram:
+            Gs = gram[np.ix_(cols, cols)]
+            Cs = cross[cols, :]
+            try:
+                beta = np.linalg.solve(Gs, Cs)
+                explained_ss = float(np.sum(Cs * beta))
+                r_squared = explained_ss / total_ss
+            except np.linalg.LinAlgError:
+                Xs = Xc[:, cols]
+                beta, _, _, _ = np.linalg.lstsq(Xs, Yc, rcond=None)
+                fitted = Xs @ beta
+                r_squared = float(np.sum(fitted * fitted)) / total_ss
+        else:
+            Xs = Xc[:, cols]
+            beta, _, _, _ = np.linalg.lstsq(Xs, Yc, rcond=None)
+            fitted = Xs @ beta
+            r_squared = float(np.sum(fitted * fitted)) / total_ss
+
+        # Match the tiny numerical guards used by the legacy RDA path.
+        if r_squared > 1.0 and r_squared < 1.0 + 1e-12:
+            r_squared = 1.0
+        elif r_squared < 0.0 and r_squared > -1e-12:
+            r_squared = 0.0
+
+        if type == "adjR2":
+            r_squared = calculate_adjusted_r2(r_squared, n_samples, k)
+        out[i] = r_squared
+
+    return out
+
+
+@lru_cache(maxsize=None)
+def _get_hp_individual_r2_weights(n_items: int) -> np.ndarray:
+    """Precompute the linear map from subset R2 values to rounded HP Individual values.
+
+    The coefficients are derived from the package's existing commonality
+    inclusion-exclusion structure, so the fast permutation path preserves the
+    same hierarchical-partitioning definition rather than introducing a new one.
+    """
+    binary_matrix, total_combinations, bit_counts, _, _, commonlist = _get_hp_cached_structures(n_items)
+    weights = np.zeros((n_items, total_combinations), dtype=float)
+
+    for common_idx, r2list in enumerate(commonlist):
+        active_items = np.flatnonzero(binary_matrix[:, common_idx])
+        if active_items.size == 0:
+            continue
+        hp_weight = 1.0 / (bit_counts[common_idx] + 1e-10)
+        for signed_index in r2list:
+            r2_index = abs(signed_index) - 1
+            if r2_index < 0:
+                continue
+            sign = -1.0 if signed_index < 0 else 1.0
+            weights[active_items, r2_index] += sign * hp_weight
+
+    weights.setflags(write=False)
+    return weights
+
+
+def _rda_hp_individual_fast(dv: np.ndarray, group_arrays, type: str = "adjR2",
+                            scale: bool = False) -> np.ndarray:
+    """Return only the RDA HP Individual column using the fast subset kernel.
+
+    This internal helper is intended for permutation runs, where constructing a
+    full RdaccaHpResult/DataFrame for every randomization is unnecessary.
+    """
+    Y = _as_2d_float_array(dv)
+    if scale:
+        Y = (Y - np.mean(Y, axis=0)) / np.std(Y, axis=0)
+
+    n_items = len(group_arrays)
+    _, _, _, _, combo_indices, _ = _get_hp_cached_structures(n_items)
+    r2_values = _rda_subset_r2_values_fast(Y, group_arrays, combo_indices, type)
+    weights = _get_hp_individual_r2_weights(n_items)
+
+    # Keep the package's historical 4-decimal Individual values, because the
+    # permutation ECDF is computed from those rounded values.
+    individual = np.empty(n_items, dtype=float)
+    for j in range(n_items):
+        individual[j] = round(float(np.dot(weights[j], r2_values)), 4)
+    return individual
+
+
 def chi_square_transform(Y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Apply the same initial chi-square transformation as vegan::initCA."""
     Y = _as_2d_float_array(Y)
@@ -528,6 +672,133 @@ def _apply_distance_correction(distance_matrix: np.ndarray, add=False) -> np.nda
         raise ValueError("add must be False, True, 'lingoes', or 'cailliez'")
     return euclidify_distance_matrix(distance_matrix, method=method)
 
+def _prepare_dbrda_vegan_response(dv_dist: np.ndarray, add=False, sqrt_dist: bool = False):
+    """Prepare the response-side matrices shared by all default db-RDA subsets.
+
+    For a fixed response dissimilarity matrix, Gower centering does not depend on
+    which explanatory-variable subset is being fitted.  The legacy path rebuilt
+    this matrix for every subset; the fast path computes it once and reuses it.
+    """
+    distance_matrix = coerce_distance_input(dv_dist)
+
+    if sqrt_dist:
+        distance_matrix = np.sqrt(distance_matrix)
+
+    distance_matrix = _apply_distance_correction(distance_matrix, add=add)
+
+    n_samples = distance_matrix.shape[0]
+    J = np.eye(n_samples) - np.ones((n_samples, n_samples)) / n_samples
+    B = -0.5 * J @ (distance_matrix ** 2) @ J
+    total_inertia = float(np.trace(B))
+    return B, total_inertia
+
+
+def _dbrda_subset_r2_values_fast(dv_dist: np.ndarray, group_arrays, combo_indices,
+                                  type: str = "adjR2", add=False,
+                                  sqrt_dist: bool = False) -> np.ndarray:
+    """Compute default vegan::dbrda-style R2/adjR2 for all predictor subsets.
+
+    The response-side Gower matrix ``B`` is prepared once.  For a well-conditioned
+    full-rank predictor design we also reuse
+
+        G = X'X
+        Q = X' B X
+
+    across all logical subsets, using
+
+        constrained inertia = trace(solve(G_s, Q_s)).
+
+    This is the cyclic-trace form of ``trace(HB)`` used by the existing db-RDA
+    implementation.  Rank-deficient or ill-conditioned designs fall back to the
+    existing projection-matrix calculation subset by subset.
+    """
+    B, total_inertia = _prepare_dbrda_vegan_response(
+        dv_dist, add=add, sqrt_dist=sqrt_dist
+    )
+
+    groups = []
+    for group in group_arrays:
+        arr = _as_2d_float_array(group)
+        if arr.shape[0] != B.shape[0]:
+            raise ValueError(
+                "Dependent and independent variables must have the same number of rows."
+            )
+        groups.append(arr)
+
+    if not groups:
+        return np.empty(0, dtype=float)
+
+    n_samples = B.shape[0]
+    widths = [g.shape[1] for g in groups]
+    starts = np.cumsum([0] + widths)
+    X = np.hstack(groups)
+    Xc = X - np.mean(X, axis=0, keepdims=True)
+
+    n_total_cols = Xc.shape[1]
+    full_rank = np.linalg.matrix_rank(Xc) == n_total_cols
+    use_shared_system = bool(full_rank)
+    if use_shared_system and n_total_cols > 1:
+        try:
+            use_shared_system = np.linalg.cond(Xc) < 1e8
+        except np.linalg.LinAlgError:
+            use_shared_system = False
+
+    if use_shared_system:
+        gram = Xc.T @ Xc
+        # B is symmetric; this is X' B X and is shared by every subset.
+        xb_cross = Xc.T @ (B @ Xc)
+    else:
+        gram = xb_cross = None
+
+    out = np.empty(len(combo_indices), dtype=float)
+
+    for i, selected_groups in enumerate(combo_indices):
+        cols = []
+        for g in selected_groups:
+            cols.extend(range(int(starts[g]), int(starts[g + 1])))
+        cols = np.asarray(cols, dtype=np.intp)
+        k = int(cols.size)
+
+        if abs(total_inertia) < 1e-12:
+            # Match the existing implementation exactly: when total inertia is
+            # zero, the predictor count is the number of design columns.
+            r_squared = 0.0
+            n_predictors = k
+        elif use_shared_system:
+            Gs = gram[np.ix_(cols, cols)]
+            Qs = xb_cross[np.ix_(cols, cols)]
+            try:
+                constrained_inertia = float(np.trace(np.linalg.solve(Gs, Qs)))
+                r_squared = constrained_inertia / total_inertia
+                n_predictors = k
+            except np.linalg.LinAlgError:
+                Xs = Xc[:, cols]
+                n_predictors = int(np.linalg.matrix_rank(Xs))
+                if n_predictors == 0:
+                    r_squared = 0.0
+                else:
+                    H = Xs @ np.linalg.pinv(Xs.T @ Xs) @ Xs.T
+                    constrained_inertia = float(np.trace(H @ B))
+                    r_squared = constrained_inertia / total_inertia
+        else:
+            # Preserve the numerically safer legacy behavior for rank-deficient
+            # or highly ill-conditioned designs.
+            Xs = Xc[:, cols]
+            n_predictors = int(np.linalg.matrix_rank(Xs))
+            if n_predictors == 0:
+                r_squared = 0.0
+            else:
+                H = Xs @ np.linalg.pinv(Xs.T @ Xs) @ Xs.T
+                constrained_inertia = float(np.trace(H @ B))
+                r_squared = constrained_inertia / total_inertia
+
+        if type == "adjR2":
+            r_squared = calculate_adjusted_r2(r_squared, n_samples, n_predictors)
+        out[i] = r_squared
+
+    return out
+
+
 
 def _calculate_dbrda_vegan_dbrda(dv_dist: np.ndarray, iv: np.ndarray, type: str = "adjR2",
                                  add=False, sqrt_dist: bool = False) -> float:
@@ -734,18 +1005,35 @@ def _rdacca_hp_multi(dv, iv, method, type, scale, var_part, **kwargs):
     # Calculate R-squared for all group combinations
     commonM = np.zeros((total_combinations, 3))
 
+    if method.upper() == "RDA":
+        r2_values = _rda_subset_r2_values_fast(dv, iv_arrays, combo_indices, type)
+        commonM[:, 1] = r2_values
+    elif method.upper() == "DBRDA" and str(kwargs.get('dbrdatype', 'dbrda')).lower() == "dbrda":
+        r2_values = _dbrda_subset_r2_values_fast(
+            dv,
+            iv_arrays,
+            combo_indices,
+            type=type,
+            add=kwargs.get('add', False),
+            sqrt_dist=kwargs.get('sqrt_dist', False),
+        )
+        commonM[:, 1] = r2_values
+
     for i, selected_indices in enumerate(combo_indices):
         if not selected_indices:
             continue
 
-        # Combine selected groups
+        # RDA was filled in one fast batch above; other methods still need the
+        # explicit combined design matrix.
+        if method.upper() in ["RDA"]:
+            continue
+        if method.upper() == "DBRDA" and str(kwargs.get('dbrdatype', 'dbrda')).lower() == "dbrda":
+            continue
+
         combined_iv = _combine_groups(iv_arrays, list(selected_indices))
 
         # Calculate R-squared based on method
-        if method.upper() in ["RDA"]:
-            r2_value = calculate_rda(dv, combined_iv, type)
-            commonM[i, 1] = r2_value
-        elif method.upper() in ["CCA"]:
+        if method.upper() in ["CCA"]:
             r2_value = calculate_cca(
                 dv,
                 combined_iv,
@@ -927,16 +1215,35 @@ def _rdacca_hp_single(dv, iv, method, type, scale, var_part, **kwargs):
     # Calculate R-squared for all combinations
     commonM = np.zeros((total_combinations, 3))
 
+    if method.upper() == "RDA":
+        # Fast algebraically-equivalent route: reuse centered cross-products for
+        # every subset instead of calling lstsq 2^p - 1 times.
+        r2_values = _rda_subset_r2_values_fast(
+            dv, [iv[:, [j]] for j in range(n_vars)], combo_indices, type
+        )
+        commonM[:, 1] = r2_values
+    elif method.upper() == "DBRDA" and str(kwargs.get('dbrdatype', 'dbrda')).lower() == "dbrda":
+        r2_values = _dbrda_subset_r2_values_fast(
+            dv,
+            [iv[:, [j]] for j in range(n_vars)],
+            combo_indices,
+            type=type,
+            add=kwargs.get('add', False),
+            sqrt_dist=kwargs.get('sqrt_dist', False),
+        )
+        commonM[:, 1] = r2_values
+
     for i, selected_indices in enumerate(combo_indices):
         if not selected_indices:
             continue
 
         subset_iv = iv[:, selected_indices]
 
-        # Calculate R-squared based on method
+        # RDA was filled in one fast batch above.
         if method.upper() in ["RDA"]:
-            r2_value = calculate_rda(dv, subset_iv, type)
-            commonM[i, 1] = r2_value
+            continue
+        elif method.upper() == "DBRDA" and str(kwargs.get('dbrdatype', 'dbrda')).lower() == "dbrda":
+            continue
         elif method.upper() in ["CCA"]:
             r2_value = calculate_cca(
                 dv,
